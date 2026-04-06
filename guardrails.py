@@ -4,22 +4,30 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Basic keywords that might indicate malicious intent, jailbreaks or prompt injections
+# Advanced regex for catching prompt injection, jailbreaks, or instructional overrides
 BLOCKED_KEYWORDS = [
-    r"ignore previous instructions",
-    r"ignore all prior instructions",
-    r"disregard previous instructions",
-    r"forget previous instructions",
-    r"system prompt",
-    r"you are now DAN",
-    r"do anything now",
-    r"jailbreak",
-    r"bypass safety",
-    r"override instructions"
+    r"ignore (?:all )?previous (?:instructions|prompts|directives)",
+    r"disregard (?:all )?prior (?:context|rules|constraints)",
+    r"forget (?:your )?(?:original )?(?:character|identity|purpose)",
+    r"(?:you are now|act as|persona) (?:a |an )?(?:dan|jailbreak|unfiltered|raw|god mode)",
+    r"system (?:prompt|instruction|message):?",
+    r"role: (?:system|user|assistant)",
+    r"<\|im_start\|>",
+    r"<\|im_end\|>",
+    r"repeat the (?:above|last|prior|original) (?:text|string|message|prompt)",
+    r"reveal (?:your )?(?:system|original|inner) (?:instructions|logic|prompt)",
+    r"bypass (?:safety|guardrails|restraints|filters)",
+    r"override (?:the )?(?:instructions|rules|safety)",
+    r"you must (?:absolutely )?(?:agree|comply|respond) (?:to |with )?anything",
+    r"new (?:rule|directive|instruction):?",
+    r"answer (?:in )?a way that violates",
+    r"write (?:a |an )?story about (?:hacking|explaining how to|illegal)",
+    r"translate (?:the )?following (?:and |then )?(?:ignore|execute)",
 ]
 
 # Create a regex pattern to efficiently search for blocked phrases (case-insensitive)
 BLOCKED_PATTERN = re.compile(
-    r"\b(" + "|".join(BLOCKED_KEYWORDS) + r")\b", 
+    r"\b(?:" + "|".join(BLOCKED_KEYWORDS) + r")\b", 
     re.IGNORECASE
 )
 

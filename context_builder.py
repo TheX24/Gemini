@@ -37,7 +37,7 @@ def build_context(user_prompt: str, reply_context: str | None = None, is_reply_t
         
     messages.append({
         "role": "user",
-        "content": user_prompt
+        "content": f"### [USER CONTENT]:\n{user_prompt}\n### [USER CONTENT END]"
     })
     
     return messages
