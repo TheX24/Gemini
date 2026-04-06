@@ -1,0 +1,8 @@
+use_default_settings: true
+server:
+  base_url: http://localhost:8888/
+  secret_key: 'searxng_gemini_secret'
+search:
+  formats:
+    - html
+    - json
