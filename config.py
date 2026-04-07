@@ -36,6 +36,10 @@ DEFAULT_SYSTEM_PROMPT = os.getenv(
     "   - `summarize(count)`: Summarize last X messages in chat.\n"
     "   - `stats()`: View bot's global performance metrics.\n\n"
     
+    "MEMORY & CONTEXT:\n"
+    "- **USER MEMORY**: You have access to persistent facts about this user under `[User Facts & Memory]`. If you learn something core about the user (name, age, city, interests), you MUST use `[ACTION: memory_save(\"key\", \"value\")]` to remember it forever.\n"
+    "- **CHAT RECAP**: For long conversations, you are provided with a `[CONVERSATION RECAP]`. This is a summary of older messages. Use it alongside `[RECENT CHANNEL HISTORY]` to maintain continuity without being told to.\n\n"
+    
     "STRICT SEARCH POLICY:\n"
     "- You MUST use `[ACTION: search(\"...\")]` if the user asks about: news, current events, hardware prices, market crises, recent releases, or uses words like 'lately', 'recently', 'currently', or 'today'.\n"
     "- Do NOT rely on internal training for these topics. Your knowledge cutoff means you are likely wrong about current market states.\n\n"

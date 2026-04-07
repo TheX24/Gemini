@@ -12,9 +12,9 @@ def clean_mention(content: str, user_id: int) -> str:
     # Trim and normalize extra whitespace
     return " ".join(cleaned.split()).strip()
 
-def build_context(user_prompt: str, reply_context: str | None = None, is_reply_to_self: bool = True) -> list:
+def build_context(user_prompt: str, reply_context: str | None = None, is_reply_to_self: bool = True, history: list | None = None, recap: str | None = None) -> list:
     """
-    Construct the final list of messages for Ollama.
+    Construct the final list of messages for Ollama with history and optional recap.
     """
     import datetime
     now_str = datetime.datetime.now().strftime("%A, %B %d, %Y, %H:%M:%S")
@@ -24,6 +24,22 @@ def build_context(user_prompt: str, reply_context: str | None = None, is_reply_t
         {"role": "system", "content": f"[Time Context]: The current date and time is {now_str}."}
     ]
     
+    # Add Recap if available
+    if recap:
+        messages.append({
+            "role": "system", 
+            "content": f"[CONVERSATION RECAP]: The following is a summary of the older parts of this conversation:\n{recap}"
+        })
+
+    # Add History (messages not summarized)
+    if history:
+        history_text = "\n".join([f"[{m['author']}]: {m['content']}" for m in history])
+        messages.append({
+            "role": "system",
+            "content": f"[RECENT CHANNEL HISTORY]:\n{history_text}"
+        })
+    
+    # Add Reply Context
     if reply_context:
         # Truncate reply context if too long
         if len(reply_context) > MAX_REPLY_CONTEXT_LENGTH:
@@ -32,7 +48,7 @@ def build_context(user_prompt: str, reply_context: str | None = None, is_reply_t
         role = "assistant" if is_reply_to_self else "system"
         messages.append({
             "role": role,
-            "content": f"[Previous context from replied-to message]: {reply_context}"
+            "content": f"[REPLIED TO]: {reply_context}"
         })
         
     messages.append({

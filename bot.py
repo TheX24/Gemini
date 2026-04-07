@@ -106,7 +106,7 @@ class PromptQueue:
         logger.info("Starting PromptQueue worker...")
         self.worker_task = asyncio.create_task(self._worker())
 
-    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self):
+    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self, history=None):
         if user_id in self.active_user_ids:
             logger.warning(f"User {user_id} already has an active task. Put rejected.")
             return False, 0
@@ -121,7 +121,8 @@ class PromptQueue:
             "loading_msg": loading_msg,
             "user_prompt": user_prompt,
             "reply_content": reply_content,
-            "is_reply_to_self": is_reply_to_self
+            "is_reply_to_self": is_reply_to_self,
+            "history": history or []
         }
         
         await self.queue.put((user_id, task_data))
@@ -149,7 +150,8 @@ class PromptQueue:
                     task_data["loading_msg"], 
                     task_data["user_prompt"], 
                     task_data["reply_content"], 
-                    task_data["is_reply_to_self"]
+                    task_data["is_reply_to_self"],
+                    task_data["history"]
                 )
                 logger.info(f"PromptQueue: Successfully processed user {user_id}'s task.")
             except Exception as e:
@@ -256,14 +258,21 @@ class GeminiSelfBot(discord.Client):
         # Display initial loading state immediately
         loading_msg = await message.reply("> ⏳ ***Parsing intent...***")
 
-        # 5. Add to queue
+        # 5. Fetch Channel History (Context awareness)
+        history = []
+        async for msg in message.channel.history(limit=15):
+             if msg.id == message.id: continue # Skip the current trigger message
+             history.append({"author": str(msg.author), "content": msg.content})
+
+        # 6. Add to queue
         success, position = await self.prompt_queue.put(
             message.author.id, 
             message, 
             loading_msg, 
             user_prompt, 
             reply_content, 
-            is_reply_to_self
+            is_reply_to_self,
+            history=history
         )
 
         if not success:
@@ -276,16 +285,33 @@ class GeminiSelfBot(discord.Client):
         else:
             logger.info(f"on_message: User {message.author.id} added at pos 0 (Immediate Processing)")
 
-    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool):
+    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool, history: list):
         """
         Agentic loop allowing the main model to decide if it needs tools, thinking, or direct answer.
         """
         logger.info(f"process_queued_prompt: Starting agentic loop for user {message.author.id}")
         
-        # Initial context
-        messages = build_context(user_prompt, reply_content, is_reply_to_self)
+        # 1. Context Compression (Summary of old history)
+        recap = None
+        short_history = history
+        if len(history) > 5:
+            logger.info(f"Compressing history of {len(history)} messages...")
+            # Keep last 3 full, summarize everything before that
+            to_summarize = history[:-3]
+            short_history = history[-3:]
+            
+            summary_prompt = "Summarize the following Discord chat history briefly so I can understand the context of the conversation. Be concise:\n\n"
+            for m in to_summarize:
+                summary_prompt += f"[{m['author']}]: {m['content']}\n"
+            
+            # Use Ollama to summarize (background/hidden)
+            recap_res = await ask_ollama([{"role": "user", "content": summary_prompt}], client=self.ollama_http_client)
+            recap = recap_res if not recap_res.startswith("Error:") else None
+
+        # 2. Initial Context Building
+        messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap)
         
-        # Fetch memory context
+        # 3. Fetch Persistent Memories
         mems = get_memories(message.author.id)
         if mems:
             brain = "\n".join([f"- {m['key']}: {m['value']}" for m in mems])
