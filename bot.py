@@ -560,6 +560,9 @@ class GeminiSelfBot(discord.Client):
              history.append({"author": str(msg.author), "content": msg.content})
              if msg.author.id not in recent_users_map and msg.author.id != self.user.id and msg.author.id != message.author.id:
                  recent_users_map[msg.author.id] = msg.author
+                 
+        # Reverse history so it's chronologically ordered (Oldest -> Newest) for the LLM
+        history.reverse()
 
         # Extract extra context if users mention others or refer to them by name
         if len(other_users_info) < 3:
@@ -625,22 +628,10 @@ class GeminiSelfBot(discord.Client):
         """
         logger.info(f"process_queued_prompt: Starting agentic loop for user {message.author.id}")
         
-        # 1. Context Compression (Summary of old history)
+        # 1. Context Compression (Disabled for large context)
+        # Bypassing slow summarization LLM calls entirely to leverage Ollama's native KV Prompt Cache for instant evaluation.
         recap = None
         short_history = history
-        if len(history) > 25:
-            logger.info(f"Compressing history of {len(history)} messages...")
-            # Keep last 20 full, summarize everything before that
-            to_summarize = history[:-20]
-            short_history = history[-20:]
-            
-            summary_prompt = "Summarize the following Discord chat history briefly so I can understand the context of the conversation. Be concise:\n\n"
-            for m in to_summarize:
-                summary_prompt += f"[{m['author']}]: {m['content']}\n"
-            
-            # Use Ollama to summarize (background/hidden)
-            recap_res = await ask_ollama([{"role": "user", "content": summary_prompt}], client=self.ollama_http_client)
-            recap = recap_res if not recap_res.startswith("Error:") else None
 
         # 2. Build final prompt structures
         user_info_for_context = user_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
@@ -818,6 +809,12 @@ class GeminiSelfBot(discord.Client):
         
         When loading_msg is None (SHOW_LOADING_MESSAGES=false), sends a fresh reply instead of editing.
         """
+        import re
+        
+        # Clean up any leaked system tags the LLM might hallucinate
+        content = re.sub(r'\[(?i:tool_result|system|sys)\]:?\s*', '', content)
+        content = content.strip()
+
         # Pre-process content: strip out redundant protocol from markdown link display text
         # e.g., converts [https://tx24.is-a.dev/](https://tx24.is-a.dev/) to [tx24.is-a.dev](https://tx24.is-a.dev/)
         def clean_link(match):
