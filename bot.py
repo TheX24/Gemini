@@ -555,7 +555,7 @@ class GeminiSelfBot(discord.Client):
         # 5. Fetch Channel History (Context awareness)
         history = []
         recent_users_map = {}
-        async for msg in message.channel.history(limit=15):
+        async for msg in message.channel.history(limit=50):
              if msg.id == message.id: continue # Skip the current trigger message
              history.append({"author": str(msg.author), "content": msg.content})
              if msg.author.id not in recent_users_map and msg.author.id != self.user.id and msg.author.id != message.author.id:
@@ -628,11 +628,11 @@ class GeminiSelfBot(discord.Client):
         # 1. Context Compression (Summary of old history)
         recap = None
         short_history = history
-        if len(history) > 5:
+        if len(history) > 25:
             logger.info(f"Compressing history of {len(history)} messages...")
-            # Keep last 3 full, summarize everything before that
-            to_summarize = history[:-3]
-            short_history = history[-3:]
+            # Keep last 20 full, summarize everything before that
+            to_summarize = history[:-20]
+            short_history = history[-20:]
             
             summary_prompt = "Summarize the following Discord chat history briefly so I can understand the context of the conversation. Be concise:\n\n"
             for m in to_summarize:
