@@ -2,3 +2,4 @@
 __pycache__/
 .venv/
 *.log
+bot_data.db
