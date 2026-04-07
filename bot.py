@@ -187,9 +187,11 @@ async def read_image_attachments(
                 import pytesseract  # type: ignore
                 from PIL import Image  # type: ignore
                 import io
+                import os
 
                 img = Image.open(io.BytesIO(image_bytes))
-                text = pytesseract.image_to_string(img).strip()
+                ocr_lang = os.getenv("OCR_LANGUAGES", "eng")
+                text = pytesseract.image_to_string(img, lang=ocr_lang).strip()
                 if text:
                     parts.append(
                         f"### OCR from `{att.filename}`:\n"
@@ -303,7 +305,7 @@ class PromptQueue:
         logger.info("Starting PromptQueue worker...")
         self.worker_task = asyncio.create_task(self._worker())
 
-    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self, history=None, user_info=None, attachments_text=None, images_text=None):
+    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self, history=None, user_info=None, other_users_info=None, attachments_text=None, images_text=None):
         if user_id in self.active_user_ids:
             logger.warning(f"User {user_id} already has an active task. Put rejected.")
             return False, 0
@@ -321,6 +323,7 @@ class PromptQueue:
             "is_reply_to_self": is_reply_to_self,
             "history": history or [],
             "user_info": user_info or {},
+            "other_users_info": other_users_info,
             "attachments_text": attachments_text,
             "images_text": images_text,
         }
@@ -353,6 +356,7 @@ class PromptQueue:
                     task_data["is_reply_to_self"],
                     task_data["history"],
                     task_data["user_info"],
+                    task_data.get("other_users_info"),
                     task_data.get("attachments_text"),
                     task_data.get("images_text"),
                 )
@@ -368,6 +372,51 @@ class PromptQueue:
                     logger.info(f"PromptQueue: Finished cleanup for user {current_user_id}.")
                 else:
                     logger.warning("PromptQueue: Worker iteration finished without a valid user_id.")
+
+async def extract_user_metadata(user: discord.User, guild: discord.Guild) -> dict:
+    user_info = {
+        "display_name": getattr(user, "display_name", str(user)),
+        "username": str(user),
+        "id": user.id,
+        "created_at": user.created_at.strftime("%Y-%m-%d"),
+        "server_name": guild.name if guild else "Direct Message",
+        "server_roles": [r.name for r in user.roles if r.name != "@everyone"] if hasattr(user, "roles") else []
+    }
+    
+    status_list = []
+    if hasattr(user, "activities"):
+        for activity in user.activities:
+            try:
+                if activity.type == discord.ActivityType.listening:
+                    status_list.append(f"Listening to: {activity.name} - {getattr(activity, 'title', 'Unknown')} by {getattr(activity, 'artist', 'Unknown')}")
+                elif activity.type == discord.ActivityType.playing:
+                    status_list.append(f"Playing: {activity.name}")
+                elif activity.type == discord.ActivityType.streaming:
+                    status_list.append(f"Streaming: {activity.name} on {activity.platform}")
+                elif activity.type == discord.ActivityType.custom:
+                    status_list.append(f"Status: {activity.name}")
+            except:
+                continue
+    user_info["status"] = status_list
+
+    try:
+        profile = await user.profile()
+        user_info["bio"] = getattr(profile, "bio", None)
+        user_info["pronouns"] = getattr(profile, "pronouns", None)
+        user_info["premium_since"] = profile.premium_since.strftime("%Y-%m-%d") if getattr(profile, "premium_since", None) else None
+        user_info["connections"] = [f"{c.type}: {c.name}" for c in profile.connected_accounts] if hasattr(profile, "connected_accounts") else []
+        recent = getattr(profile, "user_recent_activity", None)
+        user_info["recent_activity"] = str(recent) if recent else "None"
+        leaderboards = getattr(profile, "leaderboards", None)
+        user_info["game_board"] = str(leaderboards) if leaderboards else "None"
+    except Exception as e:
+        logger.debug(f"Could not fetch profile for {user}: {e}")
+        user_info["bio"] = None
+        user_info["connections"] = []
+        user_info["recent_activity"] = "None"
+        user_info["game_board"] = "None"
+    return user_info
+
 
 class GeminiSelfBot(discord.Client):
     def __init__(self, ollama_http_client: httpx.AsyncClient, *args, **kwargs):
@@ -425,6 +474,8 @@ class GeminiSelfBot(discord.Client):
             
         is_reply_to_self = False
         reply_content = None
+        other_users_info = []
+        relevant_users_scanned = set()
         
         if message.reference:
             try:
@@ -436,6 +487,8 @@ class GeminiSelfBot(discord.Client):
                         reply_content = ref_msg.content
                     else:
                         reply_content = f"{ref_msg.author.name} said: {ref_msg.content}"
+                        other_users_info.append(await extract_user_metadata(ref_msg.author, message.guild))
+                        relevant_users_scanned.add(ref_msg.author.id)
             except discord.HTTPException:
                 pass
 
@@ -491,59 +544,41 @@ class GeminiSelfBot(discord.Client):
 
         # 5. Fetch Channel History (Context awareness)
         history = []
+        recent_users_map = {}
         async for msg in message.channel.history(limit=15):
              if msg.id == message.id: continue # Skip the current trigger message
              history.append({"author": str(msg.author), "content": msg.content})
+             if msg.author.id not in recent_users_map and msg.author.id != self.user.id and msg.author.id != message.author.id:
+                 recent_users_map[msg.author.id] = msg.author
+
+        # Extract extra context if users mention others or refer to them by name
+        if len(other_users_info) < 3:
+            for m in message.mentions:
+                if m.id != self.user.id and m.id != message.author.id and m.id not in relevant_users_scanned:
+                    other_users_info.append(await extract_user_metadata(m, message.guild))
+                    relevant_users_scanned.add(m.id)
+                    if len(other_users_info) >= 3:
+                        break
+
+        prompt_lower = user_prompt.lower()
+        if len(prompt_lower) > 3 and len(other_users_info) < 3:
+            for u_id, u in recent_users_map.items():
+                if u_id in relevant_users_scanned:
+                    continue
+                names_to_check = [u.name, getattr(u, "global_name", None), getattr(u, "display_name", None)]
+                matched = False
+                for n in names_to_check:
+                    if n and len(n) > 2 and (n.lower() in prompt_lower):
+                        matched = True
+                        break
+                if matched:
+                    other_users_info.append(await extract_user_metadata(u, message.guild))
+                    relevant_users_scanned.add(u_id)
+                    if len(other_users_info) >= 3:
+                        break
 
         # 6. Extract User Metadata (Identity awareness)
-        user = message.author
-        user_info = {
-            "display_name": user.display_name,
-            "username": str(user),
-            "id": user.id,
-            "created_at": user.created_at.strftime("%Y-%m-%d"),
-            "server_name": message.guild.name if message.guild else "Direct Message",
-            "server_roles": [r.name for r in user.roles if r.name != "@everyone"] if hasattr(user, "roles") else []
-        }
-        
-        # Extract Activities (Rich Presence / RPC)
-        status_list = []
-        for activity in user.activities:
-            try:
-                if activity.type == discord.ActivityType.listening:
-                    status_list.append(f"Listening to: {activity.name} - {getattr(activity, 'title', 'Unknown')} by {getattr(activity, 'artist', 'Unknown')}")
-                elif activity.type == discord.ActivityType.playing:
-                    status_list.append(f"Playing: {activity.name}")
-                elif activity.type == discord.ActivityType.streaming:
-                    status_list.append(f"Streaming: {activity.name} on {activity.platform}")
-                elif activity.type == discord.ActivityType.custom:
-                    status_list.append(f"Status: {activity.name}")
-            except:
-                continue
-        user_info["status"] = status_list
-
-        # Self-bot specific: Fetch Profile Bio
-        try:
-            # Profiling logic for discord.py-self
-            profile = await user.profile()
-            user_info["bio"] = getattr(profile, "bio", None)
-            user_info["pronouns"] = getattr(profile, "pronouns", None)
-            user_info["premium_since"] = profile.premium_since.strftime("%Y-%m-%d") if getattr(profile, "premium_since", None) else None
-            user_info["connections"] = [f"{c.type}: {c.name}" for c in profile.connected_accounts] if hasattr(profile, "connected_accounts") else []
-            
-            # Fetch Recent Activity / Game Info if available
-            recent = getattr(profile, "user_recent_activity", None)
-            user_info["recent_activity"] = str(recent) if recent else "None"
-            
-            # Leaderboards / Game Board (if library supports it)
-            leaderboards = getattr(profile, "leaderboards", None)
-            user_info["game_board"] = str(leaderboards) if leaderboards else "None"
-        except Exception as e:
-            logger.debug(f"Could not fetch profile for {user}: {e}")
-            user_info["bio"] = None
-            user_info["connections"] = []
-            user_info["recent_activity"] = "None"
-            user_info["game_board"] = "None"
+        user_info = await extract_user_metadata(message.author, message.guild)
 
         # 7. Add to queue
         success, position = await self.prompt_queue.put(
@@ -555,6 +590,7 @@ class GeminiSelfBot(discord.Client):
             is_reply_to_self,
             history=history,
             user_info=user_info,
+            other_users_info=other_users_info,
             attachments_text=attachments_text,
             images_text=images_text,
         )
@@ -569,7 +605,7 @@ class GeminiSelfBot(discord.Client):
         else:
             logger.info(f"on_message: User {message.author.id} added at pos 0 (Immediate Processing)")
 
-    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool, history: list, user_info: dict, attachments_text: str | None = None, images_text: str | None = None):
+    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool, history: list, user_info: dict, other_users_info: list | None = None, attachments_text: str | None = None, images_text: str | None = None):
         """
         Agentic loop allowing the main model to decide if it needs tools, thinking, or direct answer.
         """
@@ -592,8 +628,10 @@ class GeminiSelfBot(discord.Client):
             recap_res = await ask_ollama([{"role": "user", "content": summary_prompt}], client=self.ollama_http_client)
             recap = recap_res if not recap_res.startswith("Error:") else None
 
-        # 2. Initial Context Building
-        messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info)
+        # 2. Build final prompt structures
+        user_info_for_context = user_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
+        other_for_context = other_users_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
+        messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info_for_context, other_users_info=other_for_context)
 
         # Inject attachment content as a system message so the model can reason over the files
         if attachments_text:

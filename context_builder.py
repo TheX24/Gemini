@@ -12,7 +12,7 @@ def clean_mention(content: str, user_id: int) -> str:
     # Trim and normalize extra whitespace
     return " ".join(cleaned.split()).strip()
 
-def build_context(user_prompt: str, reply_context: str | None = None, is_reply_to_self: bool = True, history: list | None = None, recap: str | None = None, user_info: dict | None = None) -> list:
+def build_context(user_prompt: str, reply_context: str | None = None, is_reply_to_self: bool = True, history: list | None = None, recap: str | None = None, user_info: dict | None = None, other_users_info: list | None = None) -> list:
     """
     Construct the final list of messages for Ollama with history and optional recap.
     """
@@ -24,53 +24,61 @@ def build_context(user_prompt: str, reply_context: str | None = None, is_reply_t
         {"role": "system", "content": f"[Time Context]: The current date and time is {now_str}."}
     ]
 
-    # Add User Profile if available
-    if user_info:
+    def _format_profile(info: dict, label_str: str):
         profile_parts = [
-            f"Display Name: {user_info.get('display_name')}",
-            f"Username: {user_info.get('username')}",
-            f"ID: {user_info.get('id')}",
-            f"Account Created: {user_info.get('created_at')}",
-            f"Server: {user_info.get('server_name')}",
+            f"Display Name: {info.get('display_name')}",
+            f"Username: {info.get('username')}",
+            f"ID: {info.get('id')}",
+            f"Account Created: {info.get('created_at')}",
+            f"Server: {info.get('server_name')}",
         ]
         
-        bio = user_info.get('bio')
+        bio = info.get('bio')
         if bio:
             profile_parts.append(f"About Me (Bio): {bio}")
 
-        pronouns = user_info.get('pronouns')
+        pronouns = info.get('pronouns')
         if pronouns:
             profile_parts.append(f"Pronouns: {pronouns}")
 
-        nitro = user_info.get('premium_since')
+        nitro = info.get('premium_since')
         if nitro:
             profile_parts.append(f"Nitro/Boost Status (Tag): Active since {nitro}")
             
-        roles = user_info.get('server_roles')
+        roles = info.get('server_roles')
         if roles:
             profile_parts.append(f"Server Roles: {', '.join(roles)}")
             
-        status = user_info.get('status')
+        status = info.get('status')
         if status:
             profile_parts.append(f"Active Status: {', '.join(status)}")
 
-        connections = user_info.get('connections')
+        connections = info.get('connections')
         if connections:
             profile_parts.append(f"Connected Accounts: {', '.join(connections)}")
 
-        recent = user_info.get('recent_activity')
+        recent = info.get('recent_activity')
         if recent and recent != "None":
             profile_parts.append(f"Recent Activity: {recent}")
 
-        game_board = user_info.get('game_board')
+        game_board = info.get('game_board')
         if game_board and game_board != "None":
             profile_parts.append(f"Game Board / Leaderboards: {game_board}")
             
-        profile_text = "\n".join(profile_parts)
+        return f"{label_str}:\n" + "\n".join(profile_parts)
+
+    if user_info:
         messages.append({
             "role": "system",
-            "content": f"[SENDER PROFILE]: You are talking to the following user:\n{profile_text}"
+            "content": _format_profile(user_info, "[SENDER PROFILE]: You are talking to the following user")
         })
+
+    if other_users_info:
+        for extra_user in other_users_info:
+            messages.append({
+                "role": "system",
+                "content": _format_profile(extra_user, "[ADDITIONAL RELEVANT USER PROFILE]: Background on another user mentioned, replied to, or recently active in this chat")
+            })
     
     # Add Recap if available
     if recap:
