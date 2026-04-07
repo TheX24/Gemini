@@ -8,7 +8,6 @@ from config import (
     PHRASES_SEARCH, PHRASES_HYBRID, PHRASES_ACTION
 )
 from context_builder import clean_mention, build_context
-from router import classify_request_llm
 from ollama_client import ask_ollama, ask_ollama_json
 from tools import search_web
 from guardrails import is_safe_prompt
@@ -279,178 +278,229 @@ class GeminiSelfBot(discord.Client):
 
     async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool):
         """
-        Internal method to process a prompt once it reaches the head of the queue.
+        Agentic loop allowing the main model to decide if it needs tools, thinking, or direct answer.
         """
-        logger.info(f"process_queued_prompt: Starting processing for user {message.author.id}")
-        # Route the request using the separate router model
-        classification = await classify_request_llm(user_prompt, reply_content, self.ollama_http_client)
-        route = classification.get("route", "fast")
-        reason = classification.get("reason", "No reason provided")
+        logger.info(f"process_queued_prompt: Starting agentic loop for user {message.author.id}")
         
-        logger.info(f"Processing Task from {message.author}: Routing to {route}")
-
-        # Pick phrase set based on route
-        if route == "search_think":
-            curr_phrases = PHRASES_HYBRID
-        elif route == "search":
-            curr_phrases = PHRASES_SEARCH
-        elif route == "think":
-            curr_phrases = PHRASES_THINK
-        elif route == "action":
-            curr_phrases = PHRASES_ACTION
-        else:
-            curr_phrases = PHRASES_DEFAULT
-
-        # Change to the first real phrase now that intent is parsed
-        initial_phrase = random.choice(curr_phrases)
-        await loading_msg.edit(content=f"> ⏳ ***{initial_phrase}***")
+        # Initial context
+        messages = build_context(user_prompt, reply_content, is_reply_to_self)
         
-        # Start rotation task
-        status_task = asyncio.create_task(rotate_status(loading_msg, curr_phrases))
+        # Fetch memory context
+        mems = get_memories(message.author.id)
+        if mems:
+            brain = "\n".join([f"- {m['key']}: {m['value']}" for m in mems])
+            messages.insert(1, {"role": "system", "content": f"[User Facts & Memory]:\n{brain}"})
         
-        # Optionally trigger typing
-        async with message.channel.typing():
+        # Tracking states
+        think_enabled = "--think" in user_prompt.lower()
+        
+        # PROACTIVE SEARCH HEURISTIC
+        # Force a search if the user asks about something recent or market-related
+        search_keywords = ["lately", "recently", "current", "news", "crisis", "prices", "stock", "today", "now"]
+        is_market_query = any(k in user_prompt.lower() for k in search_keywords)
+        force_search = "--search" in user_prompt.lower() or is_market_query
+        
+        curr_phrases = PHRASES_DEFAULT
+        status_task = None
+        
+        # --- AGENTIC REACT LOOP ---
+        iteration = 0
+        max_iterations = 4
+        think_enabled = False
+        curr_phrases = PHRASES_DEFAULT
+        status_task = None
+        executed_tools = set() # Track to avoid infinite loops
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # Start/Restart rotation if needed
+            if status_task: status_task.cancel()
+            status_task = asyncio.create_task(rotate_status(loading_msg, curr_phrases))
+            
             try:
-                if route == "action":
-                    tool = classification.get("tool", "none")
-                    
-                    if tool == "reminder":
-                        secs = classification.get("time_seconds") or 60
-                        topic = classification.get("topic") or "Reminder"
-                        trigger = int(time.time()) + secs
-                        add_reminder(message.channel.id, message.id, trigger, topic)
-                        await loading_msg.edit(content=f"> ⏰ **Timer Set:** I will remind you accurately in {secs} seconds.")
-                        increment_stats(tools=1, messages=1)
-                        status_task.cancel()
-                        return
-                        
-                    elif tool == "memory_save":
-                        save_memory(message.author.id, classification.get("topic") or "note", classification.get("value") or "")
-                        await loading_msg.edit(content=f"> 🧠 **Memory Saved:** I've taken a note of that.")
-                        increment_stats(tools=1, messages=1)
-                        status_task.cancel()
-                        return
-                        
-                    elif tool == "summarize":
-                        limit = classification.get("message_count") or 50
-                        history = [msg async for msg in message.channel.history(limit=limit, before=message) if msg.author.id != self.user.id]
-                        transcript = "\n".join([f"{m.author.name}: {m.content}" for m in reversed(history)])
-                        sm = [{"role": "system", "content": "Summarize the following chat context clearly."}, {"role": "user", "content": transcript}]
-                        summary = await ask_ollama(sm, client=self.ollama_http_client)
-                        await loading_msg.edit(content=summary)
-                        increment_stats(tools=1, messages=1)
-                        status_task.cancel()
-                        return
-                        
-                    elif tool == "calculate":
-                        from tools import calculate_math
-                        expr = classification.get("expression") or ""
-                        res = await calculate_math(expr)
-                        if res["status"] == "success":
-                            await loading_msg.edit(content=f"> 🔢 **Calculation:** `{res['expression']}` = **{res['result']}**")
-                        else:
-                            await loading_msg.edit(content=f"> ❌ **Math Error:** {res['message']}")
-                        increment_stats(tools=1, messages=1)
-                        status_task.cancel()
-                        return
-                            
-                    elif tool == "translate":
-                        text = classification.get("text") or ""
-                        target = classification.get("target_lang") or "English"
-                        # Use LLM to perform the translation as defined in tools.py
-                        sm = [{"role": "system", "content": f"You are a professional translator. Translate to {target}. Output ONLY the translated text."}, {"role": "user", "content": text}]
-                        translation = await ask_ollama(sm, client=self.ollama_http_client)
-                        await loading_msg.edit(content=f"> 🌍 **Translation ({target}):**\n{translation}")
-                        increment_stats(tools=1, messages=1)
-                        status_task.cancel()
-                        return
-                        
-                    elif tool == "weather":
-                        loc = classification.get("location") or ""
-                        # Use a clean client specifically for the weather to avoid base_url/config issues
-                        async with httpx.AsyncClient(timeout=10.0) as weather_client:
-                            # URL encode the location for cities with spaces like "New York"
-                            import urllib.parse
-                            encoded_loc = urllib.parse.quote(loc)
-                            try:
-                                resp = await weather_client.get(f"https://wttr.in/{encoded_loc}?format=3")
-                                if resp.status_code == 200 and resp.text:
-                                    weather_data = resp.text.strip()
-                                    await loading_msg.edit(content=f"> ⛅ **Weather:** {weather_data}")
-                                else:
-                                    logger.warning(f"wttr.in returned {resp.status_code}")
-                                    await loading_msg.edit(content="> ⛅ **Weather Error:** Local weather service is temporarily unavailable.")
-                            except Exception as e:
-                                logger.error(f"Weather HTTP error: {e}")
-                                await loading_msg.edit(content="> ⛅ **Weather Error:** Could not connect to the weather provider.")
-                        
-                        increment_stats(tools=1, messages=1)
-                        status_task.cancel()
-                        return
-                        
-                    elif tool == "stats":
-                        stats = get_stats()
-                        servers = len(self.guilds)
-                        dashboard = (
-                            f"> 📊 **Global Bot Statistics**\n"
-                            f"> 💬 **Messages Answered:** `{stats.get('messages_answered', 0)}`\n"
-                            f"> 🔋 **Tokens Consumed:** `{stats.get('tokens_used', 0)}`\n"
-                            f"> 🔍 **Deep Searches Run:** `{stats.get('searches_run', 0)}`\n"
-                            f"> 🧰 **Tools Executed:** `{stats.get('tools_used', 0)}`\n"
-                            f"> 👁️ **Servers Monitored:** `{servers}`"
-                        )
-                        await loading_msg.edit(content=dashboard)
-                        increment_stats(tools=1, messages=1)
-                        status_task.cancel()
-                        return
-                        
+                # 1. Call Ollama
+                response = await ask_ollama(messages, think=think_enabled, client=self.ollama_http_client)
+                
+                if not response or response.strip() == "":
+                    logger.error(f"Error in agent loop iteration {iteration}: Empty response from Ollama.")
+                    # Fallback for Thinking Mode
+                    if think_enabled:
+                        response = "I have finished my reasoning process. How can I help you further?"
                     else:
-                        # SILENT FALLBACK: If tool is unknown, treat as a conversation
-                        logger.warning(f"Unrecognized tool '{tool}' for action route. Falling back to conversation.")
-                        route = "fast"
-                        # Do NOT return, let it fall through to the conversation logic below
+                        break
                 
-                # Build context
-                messages = build_context(user_prompt, reply_content, is_reply_to_self)
-                
-                # Fetch memory context for standard queries
-                mems = get_memories(message.author.id)
-                if mems:
-                    brain = "\n".join([f"- {m['key']}: {m['value']}" for m in mems])
-                    messages.insert(1, {"role": "system", "content": f"[User Facts & Notes Database]:\n{brain}"})
-                
-                # Handle Search route
-                if "search" in route:
-                    sq = classification.get("search_query") or user_prompt
-                    search_results = await search_web(sq, client=self.ollama_http_client)
+                if response.startswith("Error: "):
+                    logger.error(f"Ollama Error in loop: {response}")
+                    await loading_msg.edit(content=f"⚠️ **Ollama Error:** {response}")
+                    status_task.cancel()
+                    return
+
+                # 2. Forced Search (Iteration 1 only)
+                if iteration == 1 and force_search:
+                    logger.info("Force Search triggered by flag.")
+                    await loading_msg.edit(content=f"> 🔍 ***{random.choice(PHRASES_SEARCH)}***")
+                    curr_phrases = PHRASES_SEARCH
+                    search_results = await search_web(user_prompt, client=self.ollama_http_client)
                     increment_stats(searches=1)
-                    # Inject search results into the prompt context
-                    search_context = ""
-                    if search_results.get("status") == "success":
-                        search_context = "\n".join([f"- {r['title']}: {r['snippet']}" for r in search_results['results']])
-                    else:
-                        search_context = search_results.get('message', 'Search failed.')
+                    context = "\n".join([f"- {r['title']}: {r['snippet']}" for r in search_results.get('results', [])])
+                    messages.append({"role": "system", "content": f"[Web Search Results]:\n{context}"})
+                    force_search = False
+                    continue
+
+                # 3. Mode Switch: [MODE: think]
+                if "[MODE: think]" in response and not think_enabled:
+                    logger.info("Model requested Thinking Mode.")
+                    think_enabled = True
+                    curr_phrases = PHRASES_THINK
+                    clean_resp = response.replace("[MODE: think]", "").strip()
+                    if clean_resp:
+                        messages.append({"role": "assistant", "content": clean_resp})
+                    # Use a directive to guide the model
+                    messages.append({"role": "system", "content": "[DIRECTIVE]: You are now in Thinking Mode. Provide a detailed, step-by-step reasoning chain before your final answer."})
+                    continue
+
+                # 4. Action: [ACTION: tool(args)]
+                action_match = re.search(r'\[ACTION: (\w+)\((.*)\)\]', response)
+                if action_match:
+                    tool_name = action_match.group(1).lower()
+                    tool_args = action_match.group(2)
+                    tool_id = f"{tool_name}:{tool_args}"
+                    
+                    if tool_id in executed_tools:
+                        logger.warning(f"Model repeated tool call: {tool_id}. Breaking loop.")
+                        break
                         
-                    messages.insert(1, {
-                        "role": "system", 
-                        "content": f"[Web Search Results]:\n{search_context}"
-                    })
-                
-                # Call Ollama
-                think_enabled = "think" in route
-                response_text = await ask_ollama(messages, think=think_enabled, client=self.ollama_http_client)
-                
-                # Cancel rotation before editing
+                    logger.info(f"Model triggered tool: {tool_name}({tool_args})")
+                    executed_tools.add(tool_id)
+                    
+                    tool_result = await self._dispatch_tool(tool_name, tool_args, message, loading_msg)
+                    
+                    if tool_result == "HANDLED_UI":
+                        status_task.cancel()
+                        return
+                        
+                    messages.append({"role": "assistant", "content": response})
+                    messages.append({"role": "user", "content": f"[TOOL_RESULT]: {tool_result}"})
+                    curr_phrases = PHRASES_ACTION if tool_name != "search" else PHRASES_SEARCH
+                    continue
+
+                # 5. Final Response
                 status_task.cancel()
-                
-                # Edit the loading message with the final response
-                if response_text:
-                    # Final safety check: discard if message was somehow deleted
-                    await loading_msg.edit(content=response_text)
-                    increment_stats(messages=1)
-                else:
-                    await loading_msg.edit(content="Error: No response from assistant.")
+                await self._send_safe_response(loading_msg, response, message)
+                increment_stats(messages=1)
+                return
+
             except Exception as e:
-                status_task.cancel()
-                logger.error(f"Error processing message: {e}")
-                await loading_msg.edit(content=f"An error occurred: {str(e)}")
+                if status_task: status_task.cancel()
+                logger.error(f"Error in agent loop iteration {iteration}: {e}")
+                try:
+                    await loading_msg.edit(content=f"⚠️ **Error:** {str(e)[:1800]}")
+                except:
+                    pass
+                return
+
+    async def _send_safe_response(self, loading_msg: discord.Message, content: str, original_msg: discord.Message):
+        """Helper to send responses that might exceed Discord's 2000 character limit, prioritizing newline splits."""
+        if len(content) <= 2000:
+            await loading_msg.edit(content=content)
+            return
+
+        chunks = []
+        remaining = content
+        while len(remaining) > 0:
+            if len(remaining) <= 1900:
+                chunks.append(remaining)
+                break
+            
+            # Find the best split point (last newline before limit)
+            split_idx = remaining.rfind('\n', 0, 1900)
+            if split_idx == -1:
+                # Fallback: split at last space
+                split_idx = remaining.rfind(' ', 0, 1900)
+            if split_idx == -1:
+                # Fallback: hard split
+                split_idx = 1900
+                
+            chunks.append(remaining[:split_idx].strip())
+            remaining = remaining[split_idx:].strip()
+
+        # Edit the first chunk into the loading message
+        if chunks:
+            await loading_msg.edit(content=chunks[0])
+        
+        # Send subsequent chunks as new messages
+        for i in range(1, len(chunks)):
+            if chunks[i].strip():
+                await original_msg.channel.send(chunks[i])
+                await asyncio.sleep(0.8) # Slightly longer delay for multi-message clarity
+
+    async def _dispatch_tool(self, name: str, args: str, message: discord.Message, loading_msg: discord.Message) -> str:
+        """Helper to execute tools and return a string result for the LLM."""
+        try:
+            # Clean quotes from args
+            clean_args = args.strip(' "\'')
+            
+            if name == "search":
+                await loading_msg.edit(content=f"> 🔍 ***{random.choice(PHRASES_SEARCH)}***")
+                res = await search_web(clean_args, client=self.ollama_http_client)
+                increment_stats(searches=1)
+                if res.get("status") == "success":
+                    return "\n".join([f"- {r['title']}: {r['snippet']}" for r in res['results']])
+                return f"Search failed: {res.get('message', 'Unknown Error')}"
+                
+            elif name == "calculate":
+                from tools import calculate_math
+                res = await calculate_math(clean_args)
+                increment_stats(tools=1)
+                return f"Result: {res['result']}" if res['status'] == "success" else f"Math Error: {res['message']}"
+                
+            elif name == "weather":
+                async with httpx.AsyncClient(timeout=10.0) as wc:
+                    resp = await wc.get(f"https://wttr.in/{urllib.parse.quote(clean_args)}?format=3")
+                    increment_stats(tools=1)
+                    return resp.text.strip() if resp.status_code == 200 else "Weather service unavailable."
+                    
+            elif name == "reminder":
+                # Expecting format: seconds, "topic"
+                parts = [p.strip(' "') for p in clean_args.split(",")]
+                secs = int(parts[0]) if parts[0].isdigit() else 60
+                topic = parts[1] if len(parts) > 1 else "Reminder"
+                trigger = int(time.time()) + secs
+                add_reminder(message.channel.id, message.id, trigger, topic)
+                await loading_msg.edit(content=f"> ⏰ **Timer Set:** I will remind you accurately in {secs} seconds.")
+                increment_stats(tools=1, messages=1)
+                return "HANDLED_UI"
+                
+            elif name == "memory_save":
+                # Expecting format: "key", "value"
+                parts = [p.strip(' "') for p in clean_args.split(",")]
+                key = parts[0] if parts[0] else "note"
+                val = parts[1] if len(parts) > 1 else ""
+                save_memory(message.author.id, key, val)
+                await loading_msg.edit(content=f"> 🧠 **Memory Saved:** I've taken a note of that.")
+                increment_stats(tools=1, messages=1)
+                return "HANDLED_UI"
+                
+            elif name == "summarize":
+                limit = int(clean_args) if clean_args.isdigit() else 50
+                history = [msg async for msg in message.channel.history(limit=limit, before=message) if msg.author.id != self.user.id]
+                transcript = "\n".join([f"{m.author.name}: {m.content}" for m in reversed(history)])
+                return f"Transcribed History:\n{transcript}"
+                
+            elif name == "stats":
+                stats = get_stats()
+                dashboard = (
+                    f"> 📊 **Global Bot Statistics**\n"
+                    f"> 💬 **Messages Answered:** `{stats.get('messages_answered', 0)}`\n"
+                    f"> 🔋 **Tokens Consumed:** `{stats.get('tokens_used', 0)}`\n"
+                    f"> 🔍 **Deep Searches Run:** `{stats.get('searches_run', 0)}`\n"
+                    f"> 🧰 **Tools Executed:** `{stats.get('tools_used', 0)}`"
+                )
+                await loading_msg.edit(content=dashboard)
+                increment_stats(tools=1, messages=1)
+                return "HANDLED_UI"
+                
+            return f"Error: Tool '{name}' not found."
+        except Exception as e:
+            return f"Error executing tool {name}: {str(e)}"

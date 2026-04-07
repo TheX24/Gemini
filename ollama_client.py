@@ -51,7 +51,18 @@ async def _call_ollama(messages: list, think: bool, client: httpx.AsyncClient, m
             increment_stats(tokens=tokens_used)
             
         message = data.get("message", {})
-        return message.get("content", "Error: No response content found.")
+        content = message.get("content", "")
+        thought = message.get("thought", "") # Some versions use this field for R1 models
+        
+        # If content is empty but we have a thought, return the thought as the content
+        # so the agent loop can continue or respond.
+        if not content.strip() and thought.strip():
+            return f"<thought>\n{thought}\n</thought>"
+            
+        if not content.strip():
+            return "Error: Ollama returned an empty response."
+            
+        return content
         
     except httpx.ConnectError:
         return "Error: Could not connect to Ollama. Ensure Ollama is running locally."
