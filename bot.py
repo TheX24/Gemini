@@ -14,6 +14,10 @@ from tools import search_web
 from guardrails import is_safe_prompt
 from database import init_db, add_reminder, get_due_reminders, delete_reminder, save_memory, get_memories, increment_stats, get_stats
 import time
+import urllib.parse
+import json
+import re
+import os
 
 # Set up logging for the bot
 logger = logging.getLogger(__name__)
@@ -87,12 +91,86 @@ async def status_loop(bot: discord.Client):
             logger.error(f"Failed to update rich presence: {e}")
         
         await asyncio.sleep(60)
+        
+class PromptQueue:
+    def __init__(self, bot):
+        self.bot = bot
+        self.queue = asyncio.Queue()
+        self.active_user_ids = set()  # Tracks users currently in queue or being processed
+        self._current_user_id = None
+        self.worker_task = None
+
+    def start(self):
+        if self.worker_task is not None and not self.worker_task.done():
+            logger.info("PromptQueue worker already running.")
+            return
+        logger.info("Starting PromptQueue worker...")
+        self.worker_task = asyncio.create_task(self._worker())
+
+    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self):
+        if user_id in self.active_user_ids:
+            logger.warning(f"User {user_id} already has an active task. Put rejected.")
+            return False, 0
+        
+        self.active_user_ids.add(user_id)
+        pos = self.queue.qsize() + (1 if self._current_user_id is not None else 0)
+        
+        logger.info(f"Adding task to queue for user {user_id} (Calculated Pos: {pos})")
+        
+        task_data = {
+            "message": message,
+            "loading_msg": loading_msg,
+            "user_prompt": user_prompt,
+            "reply_content": reply_content,
+            "is_reply_to_self": is_reply_to_self
+        }
+        
+        await self.queue.put((user_id, task_data))
+        return True, pos
+
+    async def _worker(self):
+        logger.info("PromptQueue worker thread entered _worker loop.")
+        while True:
+            # Re-initialize these for every iteration to prevent scoping leak issues
+            current_user_id = None
+            current_task = None
+            
+            try:
+                # Wait for next task
+                user_id, task_data = await self.queue.get()
+                current_user_id = user_id
+                current_task = task_data
+                self._current_user_id = user_id
+                
+                logger.info(f"PromptQueue: Processing task for user {user_id}")
+                
+                # Actual prompt processing happens here
+                await self.bot.process_queued_prompt(
+                    task_data["message"], 
+                    task_data["loading_msg"], 
+                    task_data["user_prompt"], 
+                    task_data["reply_content"], 
+                    task_data["is_reply_to_self"]
+                )
+                logger.info(f"PromptQueue: Successfully processed user {user_id}'s task.")
+            except Exception as e:
+                logger.error(f"PromptQueue: ERROR for user {current_user_id}: {e}", exc_info=True)
+            finally:
+                if current_user_id:
+                    if current_user_id in self.active_user_ids:
+                        self.active_user_ids.remove(current_user_id)
+                    self._current_user_id = None
+                    self.queue.task_done()
+                    logger.info(f"PromptQueue: Finished cleanup for user {current_user_id}.")
+                else:
+                    logger.warning("PromptQueue: Worker iteration finished without a valid user_id.")
 
 class GeminiSelfBot(discord.Client):
     def __init__(self, ollama_http_client: httpx.AsyncClient, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.ollama_http_client = ollama_http_client
         self.start_time = int(time.time() * 1000)
+        self.prompt_queue = PromptQueue(self)
 
     async def on_ready(self):
         # Set online status
@@ -102,6 +180,7 @@ class GeminiSelfBot(discord.Client):
         logger.info("Self-bot is ready and listening for mentions/replies (Status: Online).")
         self.loop.create_task(self.reminder_loop())
         self.loop.create_task(status_loop(self))
+        self.prompt_queue.start()
 
     async def reminder_loop(self):
         await self.wait_until_ready()
@@ -178,12 +257,37 @@ class GeminiSelfBot(discord.Client):
         # Display initial loading state immediately
         loading_msg = await message.reply("> ⏳ ***Parsing intent...***")
 
+        # 5. Add to queue
+        success, position = await self.prompt_queue.put(
+            message.author.id, 
+            message, 
+            loading_msg, 
+            user_prompt, 
+            reply_content, 
+            is_reply_to_self
+        )
+
+        if not success:
+            await loading_msg.edit(content="> ❌ **Queue Full:** You already have an active prompt being processed or in the queue.")
+            return
+
+        if position > 0:
+            await loading_msg.edit(content=f"> ⏳ ***Queued (Position #{position})...***")
+            logger.info(f"on_message: User {message.author.id} queued at pos {position}")
+        else:
+            logger.info(f"on_message: User {message.author.id} added at pos 0 (Immediate Processing)")
+
+    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool):
+        """
+        Internal method to process a prompt once it reaches the head of the queue.
+        """
+        logger.info(f"process_queued_prompt: Starting processing for user {message.author.id}")
         # Route the request using the separate router model
         classification = await classify_request_llm(user_prompt, reply_content, self.ollama_http_client)
         route = classification.get("route", "fast")
         reason = classification.get("reason", "No reason provided")
         
-        logger.info(f"Routing to: {route} (Reason: {reason})")
+        logger.info(f"Processing Task from {message.author}: Routing to {route}")
 
         # Pick phrase set based on route
         if route == "search_think":
@@ -299,12 +403,13 @@ class GeminiSelfBot(discord.Client):
                         increment_stats(tools=1, messages=1)
                         status_task.cancel()
                         return
-
+                        
                     else:
                         # SILENT FALLBACK: If tool is unknown, treat as a conversation
                         logger.warning(f"Unrecognized tool '{tool}' for action route. Falling back to conversation.")
                         route = "fast"
                         # Do NOT return, let it fall through to the conversation logic below
+                
                 # Build context
                 messages = build_context(user_prompt, reply_content, is_reply_to_self)
                 
@@ -340,6 +445,7 @@ class GeminiSelfBot(discord.Client):
                 
                 # Edit the loading message with the final response
                 if response_text:
+                    # Final safety check: discard if message was somehow deleted
                     await loading_msg.edit(content=response_text)
                     increment_stats(messages=1)
                 else:
