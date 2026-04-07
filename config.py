@@ -37,6 +37,10 @@ DEFAULT_SYSTEM_PROMPT = os.getenv(
 # Shared settings
 TYPING_INTERVAL = 1.0  # Optional interval to re-trigger typing indicator
 MAX_REPLY_CONTEXT_LENGTH = 1000  # Max characters to pull from replied-to message
+# When True (default), the bot edits the initial message with live status phrases
+# ("Parsing intent...", "Searching...", etc.) while it processes.
+# When False, the bot sends a silent placeholder and only reveals the final answer.
+SHOW_LOADING_MESSAGES = os.getenv("SHOW_LOADING_MESSAGES", "true").lower() not in ("false", "0", "no")
 
 # Loading placeholders
 PHRASES_DEFAULT = [

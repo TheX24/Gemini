@@ -5,7 +5,7 @@ import httpx
 import random
 from config import (
     OLLAMA_MODEL, PHRASES_DEFAULT, PHRASES_THINK, 
-    PHRASES_SEARCH, PHRASES_HYBRID, PHRASES_ACTION
+    PHRASES_SEARCH, PHRASES_HYBRID, PHRASES_ACTION, SHOW_LOADING_MESSAGES
 )
 from context_builder import clean_mention, build_context
 from ollama_client import ask_ollama, ask_ollama_json, ask_ollama_vision
@@ -161,7 +161,7 @@ async def read_image_attachments(
 
         if OLLAMA_VISION_MODEL and method == "vision":
             # --- Primary path: Ollama vision model ---
-            if status_msg:
+            if status_msg and SHOW_LOADING_MESSAGES:
                 gpu_label = "GPU" if VISION_NUM_GPU != 0 else "CPU"
                 await status_msg.edit(content=(
                     f"> 🧠 ***Running `{OLLAMA_VISION_MODEL}` ({gpu_label}) on `{att.filename}`..."
@@ -178,7 +178,7 @@ async def read_image_attachments(
             parts.append(f"### Image: `{att.filename}` (analysed by {OLLAMA_VISION_MODEL})\n{description}")
         else:
             # --- Fallback path: pytesseract OCR ---
-            if status_msg:
+            if status_msg and SHOW_LOADING_MESSAGES:
                 await status_msg.edit(content=(
                     f"> 🔍 ***Running OCR on `{att.filename}`..."
                     f" ({image_atts.index(att) + 1}/{len(image_atts)})***"
@@ -223,7 +223,16 @@ logger = logging.getLogger(__name__)
 async def rotate_status(loading_msg: discord.Message, phrases: list):
     """
     Background task to rotate loading phrases if generation takes a while.
+    Silently exits when SHOW_LOADING_MESSAGES is disabled.
     """
+    if not SHOW_LOADING_MESSAGES:
+        try:
+            while True:
+                await asyncio.sleep(3600)  # Park the task; it will be cancelled externally
+        except asyncio.CancelledError:
+            pass
+        return
+
     used_phrases = set()
     try:
         while True:
@@ -540,7 +549,9 @@ class GeminiSelfBot(discord.Client):
 
         # Display initial loading state (only if not already set by image processing above)
         if loading_msg is None:
-            loading_msg = await message.reply("> ⏳ ***Parsing intent...***")
+            if SHOW_LOADING_MESSAGES:
+                loading_msg = await message.reply("> ⏳ ***Parsing intent...***")
+            # else: loading_msg stays None — we reply directly at the end
 
         # 5. Fetch Channel History (Context awareness)
         history = []
@@ -596,10 +607,14 @@ class GeminiSelfBot(discord.Client):
         )
 
         if not success:
-            await loading_msg.edit(content="> ❌ **Queue Full:** You already have an active prompt being processed or in the queue.")
+            err_text = "> ❌ **Queue Full:** You already have an active prompt being processed or in the queue."
+            if loading_msg:
+                await loading_msg.edit(content=err_text)
+            else:
+                await message.reply(err_text)
             return
 
-        if position > 0:
+        if position > 0 and loading_msg:
             await loading_msg.edit(content=f"> ⏳ ***Queued (Position #{position})...***")
             logger.info(f"on_message: User {message.author.id} queued at pos {position}")
         else:
@@ -729,7 +744,8 @@ class GeminiSelfBot(discord.Client):
                 # 2. Forced Search (Iteration 1 only)
                 if iteration == 1 and force_search:
                     logger.info("Force Search triggered by flag.")
-                    await loading_msg.edit(content=f"> 🔍 ***{random.choice(PHRASES_SEARCH)}***")
+                    if SHOW_LOADING_MESSAGES:
+                        await loading_msg.edit(content=f"> 🔍 ***{random.choice(PHRASES_SEARCH)}***")
                     curr_phrases = PHRASES_SEARCH
                     search_results = await search_web(user_prompt, client=self.ollama_http_client)
                     increment_stats(searches=1)
@@ -789,13 +805,20 @@ class GeminiSelfBot(discord.Client):
                 if status_task: status_task.cancel()
                 logger.error(f"Error in agent loop iteration {iteration}: {e}")
                 try:
-                    await loading_msg.edit(content=f"⚠️ **Error:** {str(e)[:1800]}")
+                    err_text = f"⚠️ **Error:** {str(e)[:1800]}"
+                    if loading_msg:
+                        await loading_msg.edit(content=err_text)
+                    else:
+                        await message.reply(err_text)
                 except:
                     pass
                 return
 
-    async def _send_safe_response(self, loading_msg: discord.Message, content: str, original_msg: discord.Message):
-        """Helper to send responses that might exceed Discord's 2000 character limit, prioritizing newline splits."""
+    async def _send_safe_response(self, loading_msg: discord.Message | None, content: str, original_msg: discord.Message):
+        """Helper to send responses that might exceed Discord's 2000 character limit, prioritizing newline splits.
+        
+        When loading_msg is None (SHOW_LOADING_MESSAGES=false), sends a fresh reply instead of editing.
+        """
         # Pre-process content: strip out redundant protocol from markdown link display text
         # e.g., converts [https://tx24.is-a.dev/](https://tx24.is-a.dev/) to [tx24.is-a.dev](https://tx24.is-a.dev/)
         def clean_link(match):
@@ -812,38 +835,40 @@ class GeminiSelfBot(discord.Client):
         import re
         content = re.sub(r'\[(.*?)\]\((https?://.*?)\)', clean_link, content)
 
+        # Split into chunks (Discord 2000-char limit)
         if len(content) <= 2000:
-            await loading_msg.edit(content=content)
-            return
+            chunks = [content]
+        else:
+            chunks = []
+            remaining = content
+            while len(remaining) > 0:
+                if len(remaining) <= 1900:
+                    chunks.append(remaining)
+                    break
+                split_idx = remaining.rfind('\n', 0, 1900)
+                if split_idx == -1:
+                    split_idx = remaining.rfind(' ', 0, 1900)
+                if split_idx == -1:
+                    split_idx = 1900
+                chunks.append(remaining[:split_idx].strip())
+                remaining = remaining[split_idx:].strip()
 
-        chunks = []
-        remaining = content
-        while len(remaining) > 0:
-            if len(remaining) <= 1900:
-                chunks.append(remaining)
-                break
-            
-            # Find the best split point (last newline before limit)
-            split_idx = remaining.rfind('\n', 0, 1900)
-            if split_idx == -1:
-                # Fallback: split at last space
-                split_idx = remaining.rfind(' ', 0, 1900)
-            if split_idx == -1:
-                # Fallback: hard split
-                split_idx = 1900
-                
-            chunks.append(remaining[:split_idx].strip())
-            remaining = remaining[split_idx:].strip()
-
-        # Edit the first chunk into the loading message
-        if chunks:
-            await loading_msg.edit(content=chunks[0])
-        
-        # Send subsequent chunks as new messages
-        for i in range(1, len(chunks)):
-            if chunks[i].strip():
-                await original_msg.channel.send(chunks[i])
-                await asyncio.sleep(0.8) # Slightly longer delay for multi-message clarity
+        if loading_msg is not None:
+            # Edit the pre-existing placeholder into the first chunk
+            if chunks:
+                await loading_msg.edit(content=chunks[0])
+            for i in range(1, len(chunks)):
+                if chunks[i].strip():
+                    await original_msg.channel.send(chunks[i])
+                    await asyncio.sleep(0.8)
+        else:
+            # No placeholder exists — reply fresh and send continuations
+            if chunks:
+                await original_msg.reply(chunks[0])
+            for i in range(1, len(chunks)):
+                if chunks[i].strip():
+                    await original_msg.channel.send(chunks[i])
+                    await asyncio.sleep(0.8)
 
     async def _dispatch_tool(self, name: str, args: str, message: discord.Message, loading_msg: discord.Message) -> str:
         """Helper to execute tools and return a string result for the LLM."""
@@ -852,7 +877,8 @@ class GeminiSelfBot(discord.Client):
             clean_args = args.strip(' "\'')
             
             if name == "search":
-                await loading_msg.edit(content=f"> 🔍 ***{random.choice(PHRASES_SEARCH)}***")
+                if SHOW_LOADING_MESSAGES:
+                    await loading_msg.edit(content=f"> 🔍 ***{random.choice(PHRASES_SEARCH)}***")
                 res = await search_web(clean_args, client=self.ollama_http_client)
                 increment_stats(searches=1)
                 if res.get("status") == "success":
@@ -878,7 +904,11 @@ class GeminiSelfBot(discord.Client):
                 topic = parts[1] if len(parts) > 1 else "Reminder"
                 trigger = int(time.time()) + secs
                 add_reminder(message.channel.id, message.id, trigger, topic)
-                await loading_msg.edit(content=f"> ⏰ **Timer Set:** I will remind you accurately in {secs} seconds.")
+                reply_text = f"> ⏰ **Timer Set:** I will remind you accurately in {secs} seconds."
+                if loading_msg:
+                    await loading_msg.edit(content=reply_text)
+                else:
+                    await message.reply(reply_text)
                 increment_stats(tools=1, messages=1)
                 return "HANDLED_UI"
                 
@@ -888,7 +918,11 @@ class GeminiSelfBot(discord.Client):
                 key = parts[0] if parts[0] else "note"
                 val = parts[1] if len(parts) > 1 else ""
                 save_memory(message.author.id, key, val)
-                await loading_msg.edit(content=f"> 🧠 **Memory Saved:** I've taken a note of that.")
+                reply_text = "> 🧠 **Memory Saved:** I've taken a note of that."
+                if loading_msg:
+                    await loading_msg.edit(content=reply_text)
+                else:
+                    await message.reply(reply_text)
                 increment_stats(tools=1, messages=1)
                 return "HANDLED_UI"
                 
@@ -907,13 +941,17 @@ class GeminiSelfBot(discord.Client):
                     f"> 🔍 **Deep Searches Run:** `{stats.get('searches_run', 0)}`\n"
                     f"> 🧰 **Tools Executed:** `{stats.get('tools_used', 0)}`"
                 )
-                await loading_msg.edit(content=dashboard)
+                if loading_msg:
+                    await loading_msg.edit(content=dashboard)
+                else:
+                    await message.reply(dashboard)
                 increment_stats(tools=1, messages=1)
                 return "HANDLED_UI"
                 
             elif name == "fetch_url":
                 from tools import fetch_url
-                await loading_msg.edit(content=f"> 🌐 ***Fetching URL content...***")
+                if SHOW_LOADING_MESSAGES:
+                    await loading_msg.edit(content=f"> 🌐 ***Fetching URL content...***")
                 res = await fetch_url(clean_args, client=self.ollama_http_client)
                 increment_stats(tools=1)
                 if res.get("status") == "success":
@@ -928,7 +966,8 @@ class GeminiSelfBot(discord.Client):
                 image_atts = [a for a in message.attachments if os.path.splitext(a.filename)[1].lower() in ALLOWED_IMAGE_EXTENSIONS]
                 if not image_atts:
                     return "Error: No images were attached to the message."
-                await loading_msg.edit(content=f"> 🖼️ ***Running Image Analysis ({method.upper()})...***")
+                if SHOW_LOADING_MESSAGES:
+                    await loading_msg.edit(content=f"> 🖼️ ***Running Image Analysis ({method.upper()})...***")
                 img_obs, img_err = await read_image_attachments(image_atts, self.ollama_http_client, loading_msg, method=method)
                 increment_stats(tools=1)
                 if img_err:
