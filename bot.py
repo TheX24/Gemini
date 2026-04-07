@@ -758,6 +758,22 @@ class GeminiSelfBot(discord.Client):
 
     async def _send_safe_response(self, loading_msg: discord.Message, content: str, original_msg: discord.Message):
         """Helper to send responses that might exceed Discord's 2000 character limit, prioritizing newline splits."""
+        # Pre-process content: strip out redundant protocol from markdown link display text
+        # e.g., converts [https://tx24.is-a.dev/](https://tx24.is-a.dev/) to [tx24.is-a.dev](https://tx24.is-a.dev/)
+        def clean_link(match):
+            display_text = match.group(1)
+            url = match.group(2)
+            if display_text.startswith("http://") or display_text.startswith("https://"):
+                import re
+                clean_text = re.sub(r'^https?://(www\.)?', '', display_text)
+                if clean_text.endswith('/'):
+                    clean_text = clean_text[:-1]
+                return f"[{clean_text}]({url})"
+            return match.group(0)
+            
+        import re
+        content = re.sub(r'\[(.*?)\]\((https?://.*?)\)', clean_link, content)
+
         if len(content) <= 2000:
             await loading_msg.edit(content=content)
             return
@@ -857,6 +873,15 @@ class GeminiSelfBot(discord.Client):
                 increment_stats(tools=1, messages=1)
                 return "HANDLED_UI"
                 
+            elif name == "fetch_url":
+                from tools import fetch_url
+                await loading_msg.edit(content=f"> 🌐 ***Fetching URL content...***")
+                res = await fetch_url(clean_args, client=self.ollama_http_client)
+                increment_stats(tools=1)
+                if res.get("status") == "success":
+                    return f"Page Content (truncated to useful portion):\n{res['content']}"
+                return f"Failed to fetch URL: {res.get('message', 'Unknown Error')}"
+
             elif name == "analyze_images":
                 method = clean_args.lower()
                 if method not in ["ocr", "vision"]:

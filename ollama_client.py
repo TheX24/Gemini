@@ -44,7 +44,7 @@ async def _call_ollama(messages: list, think: bool, client: httpx.AsyncClient, m
     try:
         logger.info(f"Ollama Request: route={'think' if think else 'fast'}, model={model}, ctx={OLLAMA_NUM_CTX}")
         
-        response = await client.post(url, json=payload, timeout=60.0)
+        response = await client.post(url, json=payload, timeout=300.0)
         response.raise_for_status()
         
         data = response.json()

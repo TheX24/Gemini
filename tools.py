@@ -121,3 +121,62 @@ async def translate_text(text: str, target_lang: str, source_lang: str = "auto")
         "status": "success",
         "instruction": f"Please translate the following text from {source_lang} to {target_lang}. Return ONLY the translated text."
     }
+
+async def fetch_url(url: str, client: httpx.AsyncClient = None) -> dict:
+    """
+    Fetch the text content of a webpage.
+    """
+    import re
+    logger.info(f"Fetch URL requested: '{url}'")
+    
+    own_client = False
+    if client is None:
+        client = httpx.AsyncClient()
+        own_client = True
+        
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+        response = await client.get(url, headers=headers, timeout=20.0, follow_redirects=True)
+        response.raise_for_status()
+        
+        text = response.text
+        content_type = response.headers.get("content-type", "").lower()
+        
+        if "text/html" in content_type:
+            # Pre-truncate massive HTML pages to prevent regex from freezing the bot
+            # 200,000 chars of HTML is more than enough to yield text
+            text = text[:200000]
+            
+            # remove script and style blocks
+            text = re.sub(r'<script.*?>.*?</script>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r'<style.*?>.*?</style>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
+            
+            # remove HTML tags
+            text = re.sub(r'<[^>]+>', ' ', text)
+            
+            # reduce whitespace
+            text = re.sub(r'\s+', ' ', text).strip()
+        
+        # Truncate text to limit context ingestion time for local LLM models
+        text = text[:10000] 
+        
+        return {
+            "url": url,
+            "content": text,
+            "status": "success"
+        }
+    except Exception as e:
+        logger.error(f"Fetch URL Error: {e}")
+        return {
+            "url": url,
+            "error": str(e),
+            "status": "error",
+            "message": f"Could not fetch url: {e}"
+        }
+    finally:
+        if own_client:
+            await client.aclose()
