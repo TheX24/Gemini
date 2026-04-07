@@ -1,6 +1,7 @@
 import httpx
 import logging
-from config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_ROUTER_MODEL, OLLAMA_NUM_CTX
+import base64
+from config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_ROUTER_MODEL, OLLAMA_NUM_CTX, OLLAMA_VISION_MODEL, VISION_NUM_GPU
 from database import increment_stats
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,51 @@ async def _call_ollama(messages: list, think: bool, client: httpx.AsyncClient, m
     except Exception as e:
         logger.error(f"Ollama API Error: {str(e)}")
         return f"Error: An unexpected error occurred while calling Ollama: {str(e)}"
+
+async def ask_ollama_vision(image_bytes: bytes, prompt: str, client: httpx.AsyncClient | None = None) -> str:
+    """
+    Send an image to the configured OLLAMA_VISION_MODEL and return its description.
+    The image is passed as a base64-encoded string in the Ollama multimodal messages API.
+    """
+    if not OLLAMA_VISION_MODEL:
+        return "Error: No vision model configured (OLLAMA_VISION_MODEL is empty)."
+
+    b64_image = base64.b64encode(image_bytes).decode("utf-8")
+    url = f"{OLLAMA_BASE_URL}/api/chat"
+    payload = {
+        "model": OLLAMA_VISION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+                "images": [b64_image],
+            }
+        ],
+        "stream": False,
+        "options": {
+            "num_gpu": VISION_NUM_GPU,  # Configurable via VISION_NUM_GPU in .env (0=CPU, -1=GPU)
+        },
+    }
+
+    async def _do_request(c: httpx.AsyncClient) -> str:
+        try:
+            logger.info(f"Ollama Vision Request: model={OLLAMA_VISION_MODEL}")
+            resp = await c.post(url, json=payload, timeout=120.0)
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get("message", {}).get("content", "").strip()
+            return content if content else "Error: Vision model returned an empty response."
+        except httpx.ConnectError:
+            return "Error: Could not connect to Ollama for vision request."
+        except Exception as e:
+            logger.error(f"Ollama Vision API Error: {e}")
+            return f"Error: Vision request failed: {e}"
+
+    if client is not None:
+        return await _do_request(client)
+    else:
+        async with httpx.AsyncClient() as new_client:
+            return await _do_request(new_client)
 
 import re
 import json
