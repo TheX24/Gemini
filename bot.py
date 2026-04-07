@@ -244,7 +244,10 @@ class GeminiSelfBot(discord.Client):
         
         # Clean the input
         user_prompt = clean_mention(message.content, self.user.id)
-        if not user_prompt and not is_reply_to_self:
+        
+        # If no prompt text is found, only proceed if it's a reply (to self or others)
+        is_reply = message.reference is not None
+        if not user_prompt and not is_reply:
             return
 
         # Core Safety Guardrail

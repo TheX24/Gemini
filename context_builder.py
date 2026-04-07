@@ -39,21 +39,19 @@ def build_context(user_prompt: str, reply_context: str | None = None, is_reply_t
             "content": f"[RECENT CHANNEL HISTORY]:\n{history_text}"
         })
     
-    # Add Reply Context
+    # Construct final user content with reply context integrated
+    final_user_content = ""
     if reply_context:
         # Truncate reply context if too long
         if len(reply_context) > MAX_REPLY_CONTEXT_LENGTH:
             reply_context = reply_context[:MAX_REPLY_CONTEXT_LENGTH] + "..."
-            
-        role = "assistant" if is_reply_to_self else "system"
-        messages.append({
-            "role": role,
-            "content": f"[REPLIED TO]: {reply_context}"
-        })
-        
+        final_user_content += f"### [REPLIED TO CONTEXT]:\n{reply_context}\n\n"
+
+    final_user_content += f"### [USER PROMPT]:\n{user_prompt}\n### [USER PROMPT END]"
+    
     messages.append({
         "role": "user",
-        "content": f"### [USER CONTENT]:\n{user_prompt}\n### [USER CONTENT END]"
+        "content": final_user_content
     })
     
     return messages
