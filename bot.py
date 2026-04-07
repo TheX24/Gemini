@@ -187,7 +187,6 @@ async def read_image_attachments(
                 import pytesseract  # type: ignore
                 from PIL import Image  # type: ignore
                 import io
-                import os
 
                 img = Image.open(io.BytesIO(image_bytes))
                 ocr_lang = os.getenv("OCR_LANGUAGES", "eng")
@@ -964,8 +963,18 @@ class GeminiSelfBot(discord.Client):
                     method = "vision"
                     
                 image_atts = [a for a in message.attachments if os.path.splitext(a.filename)[1].lower() in ALLOWED_IMAGE_EXTENSIONS]
+                
+                # Check replied-to message if no attachments on the trigger message
+                if not image_atts and message.reference:
+                    try:
+                        ref_msg = message.reference.cached_message or await message.channel.fetch_message(message.reference.message_id)
+                        if ref_msg and ref_msg.attachments:
+                            image_atts = [a for a in ref_msg.attachments if os.path.splitext(a.filename)[1].lower() in ALLOWED_IMAGE_EXTENSIONS]
+                    except discord.HTTPException:
+                        pass
+                
                 if not image_atts:
-                    return "Error: No images were attached to the message."
+                    return "Error: No images were attached to the message or the message you replied to."
                 if SHOW_LOADING_MESSAGES:
                     await loading_msg.edit(content=f"> 🖼️ ***Running Image Analysis ({method.upper()})...***")
                 img_obs, img_err = await read_image_attachments(image_atts, self.ollama_http_client, loading_msg, method=method)
@@ -976,4 +985,5 @@ class GeminiSelfBot(discord.Client):
                 
             return f"Error: Tool '{name}' not found."
         except Exception as e:
+            logger.error(f"Error executing tool {name}: {str(e)}", exc_info=True)
             return f"Error executing tool {name}: {str(e)}"
