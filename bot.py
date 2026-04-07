@@ -106,7 +106,7 @@ class PromptQueue:
         logger.info("Starting PromptQueue worker...")
         self.worker_task = asyncio.create_task(self._worker())
 
-    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self, history=None):
+    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self, history=None, user_info=None):
         if user_id in self.active_user_ids:
             logger.warning(f"User {user_id} already has an active task. Put rejected.")
             return False, 0
@@ -122,7 +122,8 @@ class PromptQueue:
             "user_prompt": user_prompt,
             "reply_content": reply_content,
             "is_reply_to_self": is_reply_to_self,
-            "history": history or []
+            "history": history or [],
+            "user_info": user_info or {}
         }
         
         await self.queue.put((user_id, task_data))
@@ -150,8 +151,9 @@ class PromptQueue:
                     task_data["loading_msg"], 
                     task_data["user_prompt"], 
                     task_data["reply_content"], 
-                    task_data["is_reply_to_self"],
-                    task_data["history"]
+                    task_data["is_reply_to_self"], 
+                    task_data["history"],
+                    task_data["user_info"]
                 )
                 logger.info(f"PromptQueue: Successfully processed user {user_id}'s task.")
             except Exception as e:
@@ -267,7 +269,57 @@ class GeminiSelfBot(discord.Client):
              if msg.id == message.id: continue # Skip the current trigger message
              history.append({"author": str(msg.author), "content": msg.content})
 
-        # 6. Add to queue
+        # 6. Extract User Metadata (Identity awareness)
+        user = message.author
+        user_info = {
+            "display_name": user.display_name,
+            "username": str(user),
+            "id": user.id,
+            "created_at": user.created_at.strftime("%Y-%m-%d"),
+            "server_name": message.guild.name if message.guild else "Direct Message",
+            "server_roles": [r.name for r in user.roles if r.name != "@everyone"] if hasattr(user, "roles") else []
+        }
+        
+        # Extract Activities (Rich Presence / RPC)
+        status_list = []
+        for activity in user.activities:
+            try:
+                if activity.type == discord.ActivityType.listening:
+                    status_list.append(f"Listening to: {activity.name} - {getattr(activity, 'title', 'Unknown')} by {getattr(activity, 'artist', 'Unknown')}")
+                elif activity.type == discord.ActivityType.playing:
+                    status_list.append(f"Playing: {activity.name}")
+                elif activity.type == discord.ActivityType.streaming:
+                    status_list.append(f"Streaming: {activity.name} on {activity.platform}")
+                elif activity.type == discord.ActivityType.custom:
+                    status_list.append(f"Status: {activity.name}")
+            except:
+                continue
+        user_info["status"] = status_list
+
+        # Self-bot specific: Fetch Profile Bio
+        try:
+            # Profiling logic for discord.py-self
+            profile = await user.profile()
+            user_info["bio"] = getattr(profile, "bio", None)
+            user_info["pronouns"] = getattr(profile, "pronouns", None)
+            user_info["premium_since"] = profile.premium_since.strftime("%Y-%m-%d") if getattr(profile, "premium_since", None) else None
+            user_info["connections"] = [f"{c.type}: {c.name}" for c in profile.connected_accounts] if hasattr(profile, "connected_accounts") else []
+            
+            # Fetch Recent Activity / Game Info if available
+            recent = getattr(profile, "user_recent_activity", None)
+            user_info["recent_activity"] = str(recent) if recent else "None"
+            
+            # Leaderboards / Game Board (if library supports it)
+            leaderboards = getattr(profile, "leaderboards", None)
+            user_info["game_board"] = str(leaderboards) if leaderboards else "None"
+        except Exception as e:
+            logger.debug(f"Could not fetch profile for {user}: {e}")
+            user_info["bio"] = None
+            user_info["connections"] = []
+            user_info["recent_activity"] = "None"
+            user_info["game_board"] = "None"
+
+        # 7. Add to queue
         success, position = await self.prompt_queue.put(
             message.author.id, 
             message, 
@@ -275,7 +327,8 @@ class GeminiSelfBot(discord.Client):
             user_prompt, 
             reply_content, 
             is_reply_to_self,
-            history=history
+            history=history,
+            user_info=user_info
         )
 
         if not success:
@@ -288,7 +341,7 @@ class GeminiSelfBot(discord.Client):
         else:
             logger.info(f"on_message: User {message.author.id} added at pos 0 (Immediate Processing)")
 
-    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool, history: list):
+    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool, history: list, user_info: dict):
         """
         Agentic loop allowing the main model to decide if it needs tools, thinking, or direct answer.
         """
@@ -312,7 +365,7 @@ class GeminiSelfBot(discord.Client):
             recap = recap_res if not recap_res.startswith("Error:") else None
 
         # 2. Initial Context Building
-        messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap)
+        messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info)
         
         # 3. Fetch Persistent Memories
         mems = get_memories(message.author.id)
@@ -325,9 +378,9 @@ class GeminiSelfBot(discord.Client):
         
         # PROACTIVE SEARCH HEURISTIC
         # Force a search if the user asks about something recent or market-related
-        search_keywords = ["lately", "recently", "current", "news", "crisis", "prices", "stock", "today", "now", "when", "next", "upcoming"]
+        search_keywords = ["lately", "recently", "news", "crisis", "prices", "stock", "next", "upcoming", "--search"]
         is_market_query = any(k in user_prompt.lower() for k in search_keywords)
-        force_search = "--search" in user_prompt.lower() or is_market_query
+        force_search = is_market_query
         
         curr_phrases = PHRASES_DEFAULT
         status_task = None
