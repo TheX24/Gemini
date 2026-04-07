@@ -12,6 +12,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 OLLAMA_ROUTER_MODEL = os.getenv("OLLAMA_ROUTER_MODEL", "qwen2.5:1.5b")
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 
 # SearXNG Configuration
 SEARXNG_BASE_URL = os.getenv("SEARXNG_BASE_URL", "http://localhost:8888")
@@ -43,9 +44,11 @@ DEFAULT_SYSTEM_PROMPT = os.getenv(
     "STRICT SEARCH POLICY:\n"
     "- You MUST use `[ACTION: search(\"...\")]` if the user asks about: news, current events, hardware prices, market crises, recent releases, or uses words like 'lately', 'recently', 'currently', or 'today'.\n"
     "- Do NOT rely on internal training for these topics. Your knowledge cutoff means you are likely wrong about current market states.\n\n"
+    "- For scheduled or recurring events (e.g. sports, solar eclipses, Apple events), always verify the latest date via search. Your internal dates are likely outdated.\n\n"
     
     "GUIDELINES:\n"
     "- Once a tool result is provided to you as `[TOOL_RESULT]`, use it to answer the user's request immediately. Do NOT repeat the same tool call.\n"
+    "- **SEARCH CRAFTING**: When using the `search` tool, craft your query to be specific and context-aware. If the user asks a follow-up (e.g. 'what about X?'), include the subject (e.g. 'X price 2026') in your query.\n"
     "- Format all final output using Discord Markdown (*bold*, `code`, > quotes).\n"
     "- SAFETY: Refuse harmful/illegal requests firmly but politely.\n"
     "- Be concise but thorough."

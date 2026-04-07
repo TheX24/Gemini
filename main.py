@@ -7,11 +7,24 @@ from bot import GeminiSelfBot
 from searxng_manager import SearxngManager
 
 # Configure logging
+log_format = '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+date_format = '%Y-%m-%d %H:%M:%S'
+
+# Root logger configuration
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format=log_format,
+    datefmt=date_format,
+    handlers=[
+        logging.FileHandler("gemini_bot.log"),      # Save everything to file
+        logging.StreamHandler()                    # Terminal output
+    ]
 )
+
+# Silence noisy libraries on the terminal (but they remain in the log file)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("discord").setLevel(logging.WARNING)
+logging.getLogger("searxng_manager").setLevel(logging.WARNING)
 
 logger = logging.getLogger("main")
 

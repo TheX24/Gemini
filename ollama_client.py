@@ -1,6 +1,6 @@
 import httpx
 import logging
-from config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_ROUTER_MODEL
+from config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_ROUTER_MODEL, OLLAMA_NUM_CTX
 from database import increment_stats
 
 logger = logging.getLogger(__name__)
@@ -26,7 +26,10 @@ async def _call_ollama(messages: list, think: bool, client: httpx.AsyncClient, m
         "model": model,
         "messages": messages,
         "stream": False,  # Non-streaming for v1
-        "think": think    # Top-level field as per specification
+        "think": think,   # Top-level field as per specification
+        "options": {
+            "num_ctx": OLLAMA_NUM_CTX
+        }
     }
     
     # SYSTEM SANDWICH: For non-thinking routes, repeat a brief safety directive 
@@ -38,17 +41,20 @@ async def _call_ollama(messages: list, think: bool, client: httpx.AsyncClient, m
         })
     
     try:
-        logger.info(f"Ollama Request: route={'think' if think else 'fast'}, model={model}")
+        logger.info(f"Ollama Request: route={'think' if think else 'fast'}, model={model}, ctx={OLLAMA_NUM_CTX}")
         
         response = await client.post(url, json=payload, timeout=60.0)
         response.raise_for_status()
         
         data = response.json()
         
-        # Track token usage invisibly
-        tokens_used = data.get("eval_count", 0) + data.get("prompt_eval_count", 0)
-        if tokens_used > 0:
-            increment_stats(tokens=tokens_used)
+        # Track token usage
+        prompt_tokens = data.get("prompt_eval_count", 0)
+        eval_tokens = data.get("eval_count", 0)
+        
+        if prompt_tokens > 0 or eval_tokens > 0:
+            logger.info(f"[CONTEXT USAGE]: Prompt: {prompt_tokens} tokens | Generation: {eval_tokens} tokens")
+            increment_stats(tokens=(prompt_tokens + eval_tokens))
             
         message = data.get("message", {})
         content = message.get("content", "")

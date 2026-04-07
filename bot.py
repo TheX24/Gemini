@@ -322,13 +322,33 @@ class GeminiSelfBot(discord.Client):
         
         # PROACTIVE SEARCH HEURISTIC
         # Force a search if the user asks about something recent or market-related
-        search_keywords = ["lately", "recently", "current", "news", "crisis", "prices", "stock", "today", "now"]
+        search_keywords = ["lately", "recently", "current", "news", "crisis", "prices", "stock", "today", "now", "when", "next", "upcoming"]
         is_market_query = any(k in user_prompt.lower() for k in search_keywords)
         force_search = "--search" in user_prompt.lower() or is_market_query
         
         curr_phrases = PHRASES_DEFAULT
         status_task = None
         
+        # Step A: Proactive Search (if triggered by keywords)
+        if force_search:
+            logger.info(f"Force Search triggered. Refining query for: '{user_prompt}'")
+            
+            # Use a fast pass to reword based on context (history/recap)
+            refine_messages = messages + [
+                {"role": "system", "content": "Generate a single, concise, and highly effective web search query to answer the user's latest request. Use only the necessary keywords. Look at the conversation history to understand pronouns or ambiguous terms. Output ONLY the query text."}
+            ]
+            refined_query = await ask_ollama(refine_messages, client=self.ollama_http_client)
+            
+            # Clean up refined query
+            refined_query = refined_query.strip().strip('"').strip("'")
+            if refined_query and "Error:" not in refined_query:
+                # Log it so we can see the 'thought' process in terminal
+                logger.info(f"Refined Search Query: '{refined_query}'")
+                search_results = await search_web(refined_query)
+                messages.append({"role": "system", "content": f"[TOOL_RESULT (Proactive Search)]: {search_results}"})
+            else:
+                logger.warning("Query refinement failed or returned empty results.")
+
         # --- AGENTIC REACT LOOP ---
         iteration = 0
         max_iterations = 4
