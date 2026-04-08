@@ -4,3 +4,5 @@ __pycache__/
 *.log
 bot_data.db
 prompt.*
+examples/
+spicy_lyrics_knowledge.md

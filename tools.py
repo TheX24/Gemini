@@ -180,3 +180,37 @@ async def fetch_url(url: str, client: httpx.AsyncClient = None) -> dict:
     finally:
         if own_client:
             await client.aclose()
+
+async def parse_duration(duration_str: str) -> int | None:
+    """
+    Parse a duration string like '10m', '1h', '30s', '1.5h', '10 minutes' into seconds.
+    Returns None if parsing fails.
+    """
+    import re
+    
+    # Clean string
+    duration_str = duration_str.lower().strip().replace(" ", "")
+    
+    # Try regex match for common patterns
+    # Matches: 10, 10s, 10m, 10h, 1.5h, etc.
+    match = re.match(r'^([\d\.]+)([smhdw])?$', duration_str)
+    if not match:
+        # Try words
+        match = re.match(r'^([\d\.]+)(sec|second|min|minute|hr|hour|day|week)s?$', duration_str)
+        
+    if match:
+        val = float(match.group(1))
+        unit = match.group(2)
+        
+        if unit in (None, 's', 'sec', 'second'):
+            return int(val)
+        if unit in ('m', 'min', 'minute'):
+            return int(val * 60)
+        if unit in ('h', 'hr', 'hour'):
+            return int(val * 3600)
+        if unit in ('d', 'day'):
+            return int(val * 86400)
+        if unit in ('w', 'week'):
+            return int(val * 604800)
+            
+    return None

@@ -1,5 +1,6 @@
 import re
-from config import DEFAULT_SYSTEM_PROMPT, MAX_REPLY_CONTEXT_LENGTH
+from config import DEFAULT_SYSTEM_PROMPT, MAX_REPLY_CONTEXT_LENGTH, SPICY_LYRICS_KNOWLEDGE_FILE, SPICY_LYRICS_EXAMPLES_DIR
+import pathlib
 
 def clean_mention(content: str, user_id: int) -> str:
     """
@@ -12,6 +13,24 @@ def clean_mention(content: str, user_id: int) -> str:
     # Trim and normalize extra whitespace
     return " ".join(cleaned.split()).strip()
 
+def is_spicy_query(user_prompt: str, history: list | None = None) -> bool:
+    """
+    Check if the user prompt or recent history suggests a need for Spicy Lyrics knowledge.
+    """
+    spicy_keywords = [
+        "spicy", "lyrics", "ttml", "sync", "upload", "kawarp", 
+        "spicetify", "spotify id", "formatting", "genius", 
+        "musixmatch", "apple music", "mod", "extension", "guide"
+    ]
+    
+    text_to_check = user_prompt.lower()
+    if history:
+        # Check last 3 messages for context
+        history_text = " ".join([m['content'].lower() for m in history[-3:]])
+        text_to_check += " " + history_text
+        
+    return any(keyword in text_to_check for keyword in spicy_keywords)
+
 def build_context(user_prompt: str, reply_context: str | None = None, is_reply_to_self: bool = True, history: list | None = None, recap: str | None = None, user_info: dict | None = None, other_users_info: list | None = None) -> list:
     """
     Construct the final list of messages for Ollama with history and optional recap.
@@ -21,8 +40,28 @@ def build_context(user_prompt: str, reply_context: str | None = None, is_reply_t
     
     messages = [
         {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
-        {"role": "system", "content": f"[Time Context]: The current date and time is {now_str}."}
     ]
+
+
+    # 1. Inject Spicy Lyrics Knowledge Base & Examples (CONDITIONAL)
+    if is_spicy_query(user_prompt, history):
+        if SPICY_LYRICS_KNOWLEDGE_FILE and SPICY_LYRICS_KNOWLEDGE_FILE.exists():
+            try:
+                kb_content = SPICY_LYRICS_KNOWLEDGE_FILE.read_text(encoding="utf-8").strip()
+                messages.append({"role": "system", "content": f"[SPICY LYRICS KNOWLEDGE]:\n{kb_content}"})
+            except Exception as e:
+                print(f"Error loading knowledge base: {e}")
+                
+        if SPICY_LYRICS_EXAMPLES_DIR and SPICY_LYRICS_EXAMPLES_DIR.exists():
+            try:
+                for ttml_file in SPICY_LYRICS_EXAMPLES_DIR.glob("*.ttml"):
+                    example_content = ttml_file.read_text(encoding="utf-8").strip()
+                    messages.append({"role": "system", "content": f"[SPICY LYRICS EXAMPLE - {ttml_file.name}]:\n{example_content}"})
+            except Exception as e:
+                print(f"Error loading examples: {e}")
+    
+    # 2. Inject Time Context
+    messages.append({"role": "system", "content": f"[Time Context]: The current date and time is {now_str}."})
 
     def _format_profile(info: dict, label_str: str):
         profile_parts = [
@@ -178,6 +217,16 @@ def build_context(user_prompt: str, reply_context: str | None = None, is_reply_t
 
     final_user_content += f"### [USER PROMPT]:\n{user_prompt}\n### [USER PROMPT END]"
     
+
+    # SYSTEM SANDWICH: Reinforce tool execution protocol at the very end of context
+    messages.append({
+        "role": "system",
+        "content": (
+            "[ACTION REQUIRED]: If you need a tool, output exactly: [ACTION: tool_name(\"args\")]. "
+            "To use thinking mode, start with [MODE: think]. Always balance reasoning with direct tool usage."
+        )
+    })
+
     messages.append({
         "role": "user",
         "content": final_user_content

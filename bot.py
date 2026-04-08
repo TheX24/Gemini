@@ -1124,36 +1124,40 @@ class GeminiSelfBot(discord.Client):
                     increment_stats(tools=1)
                     return resp.text.strip() if resp.status_code == 200 else "Weather service unavailable."
                     
-            elif name == "reminder":
-                # Expecting format: seconds, "topic"
-                # We use a more robust split to allow commas in the topic
+            elif name in ["reminder", "set_reminder"]:
+                # Expecting format: time, "topic" (e.g. 60, "test" or "10m", "test")
                 try:
-                    # Look for first comma that separates seconds from topic
+                    # Robust argument splitting
                     first_comma = clean_args.find(',')
                     if first_comma != -1:
-                        secs_str = clean_args[:first_comma].strip(' "')
+                        time_str = clean_args[:first_comma].strip(' "')
                         topic = clean_args[first_comma+1:].strip(' "')
                     else:
-                        secs_str = clean_args.strip(' "')
+                        time_str = clean_args.strip(' "')
                         topic = "Reminder"
 
-                    # Support math expressions in seconds (e.g. 4*60*60)
-                    if not secs_str.isdigit():
+                    # 1. Try our new duration parser (handles 10m, 1h, etc.)
+                    from tools import parse_duration
+                    secs = await parse_duration(time_str)
+                    
+                    # 2. Fallback to math evaluator (handles 4*60*60)
+                    if secs is None:
                         from tools import calculate_math
-                        math_res = await calculate_math(secs_str)
+                        math_res = await calculate_math(time_str)
                         if math_res['status'] == 'success':
-                            # result could be float or int
                             secs = int(float(math_res['result']))
-                        else:
-                            secs = 60 # Default fallback
-                    else:
-                        secs = int(secs_str)
-
+                    
+                    # 3. Final default
+                    if secs is None:
+                        secs = 60 # Default fallback
+                    
                     trigger = int(time.time()) + secs
                     add_reminder(message.channel.id, message.id, trigger, topic)
                     
                     # Human-readable time
-                    if secs >= 3600:
+                    if secs >= 86400:
+                        time_desc = f"{secs/86400:.1f} days"
+                    elif secs >= 3600:
                         time_desc = f"{secs/3600:.1f} hours"
                     elif secs >= 60:
                         time_desc = f"{secs/60:.1f} minutes"

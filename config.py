@@ -27,6 +27,10 @@ SEARXNG_BASE_URL = os.getenv("SEARXNG_BASE_URL", "http://localhost:8888")
 SEARXNG_FORMAT = os.getenv("SEARXNG_FORMAT", "json")
 SEARXNG_CATEGORIES = os.getenv("SEARXNG_CATEGORIES", "general")
 
+# Knowledge Base configurations
+SPICY_LYRICS_KNOWLEDGE_FILE = pathlib.Path(__file__).parent / "spicy_lyrics_knowledge.md"
+SPICY_LYRICS_EXAMPLES_DIR = pathlib.Path(__file__).parent / "examples"
+
 # System Prompt for the assistant
 # Loads from prompt.md (next to this file) first, then falls back to SYSTEM_PROMPT env var.
 _PROMPT_FILE = pathlib.Path(__file__).parent / "prompt.md"
