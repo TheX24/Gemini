@@ -48,28 +48,53 @@ MAX_REPLY_CONTEXT_LENGTH = 1000  # Max characters to pull from replied-to messag
 SHOW_LOADING_MESSAGES = os.getenv("SHOW_LOADING_MESSAGES", "true").lower() not in ("false", "0", "no")
 
 # Loading placeholders
+PHRASES_QUEUE = [
+    "Waiting in queue...", "Stationed in queue...", "Holding for processing...",
+    "Next in line...", "Processing others first...", "Patience is a virtue...",
+    "Queue is moving...", "Your request is important to us...", "Standby...",
+    "Preparing for your turn...", "Warming up for you...", "Queueing up..."
+]
+PHRASES_PARSING = [
+
+    "Parsing intent...", "Understanding request...", "Analyzing prompt...", 
+    "Deciphering request...", "Identifying purpose...", "Mapping goals...",
+    "Interpreting message...", "Translating intent...", "Unpacking request...",
+    "Scanning for context...", "Evaluating sentiment...", "Extracting core task..."
+]
 PHRASES_DEFAULT = [
+
     "Analysing...", "Synthesizing...", "Drafting...", "Processing...", 
     "Summarizing...", "Generating response...", "Preparing answer...", 
-    "Thinking...", "Working on that...", "Building response..."
+    "Thinking...", "Working on that...", "Building response...",
+    "Consulting the oracle...", "Decoding patterns...", "Fine-tuning thoughts...",
+    "Assembling insights...", "Formulating words...", "Polishing response...",
+    "Navigating latent space...", "Compiling answer...", "Structuring thoughts..."
 ]
 PHRASES_THINK = [
     "Thinking...", "Reasoning...", "Strategizing...", "Evaluating...", 
     "Solving...", "Formulating plan...", "Considering context...", 
-    "Weighing options...", "Connecting dots...", "Reviewing logic..."
+    "Weighing options...", "Connecting dots...", "Reviewing logic...",
+    "Deep diving...", "Ruminating...", "Simulating outcomes...",
+    "Verifying assumptions...", "Exploring possibilities...", "Calculating paths..."
 ]
 PHRASES_SEARCH = [
     "Searching...", "Verifying...", "Fact-checking...", "Gathering latest data...", 
     "Filtering results...", "Looking up information...", "Scanning the web...", 
-    "Querying sources...", "Retrieving details...", "Checking references..."
+    "Querying sources...", "Retrieving details...", "Checking references...",
+    "Indexing reality...", "Sifting through noise...", "Probing the network...",
+    "Auditing information...", "Cross-checking world state...", "Trawling the web..."
 ]
 PHRASES_HYBRID = [
     "Analyzing and Searching...", "Gathering and Reasoning...", 
     "Synthesizing latest info...", "Looking up and evaluating...", 
-    "Cross-referencing...", "Researching...", "Searching and thinking..."
+    "Cross-referencing...", "Researching...", "Searching and thinking...",
+    "Fusing knowledge and logic...", "Merging search and thought...",
+    "Augmenting context...", "Syncing reality and reasoning..."
 ]
 
 PHRASES_ACTION = [
     "Executing tool...", "Parsing request...", "Using tools...",
-    "Routing action...", "Configuring tool..."
+    "Routing action...", "Configuring tool...", "Dispatching task...",
+    "Performing action...", "Interfacing with system...", "Bridging logic..."
 ]
+

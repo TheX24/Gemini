@@ -5,8 +5,11 @@ import httpx
 import random
 from config import (
     OLLAMA_MODEL, PHRASES_DEFAULT, PHRASES_THINK, 
-    PHRASES_SEARCH, PHRASES_HYBRID, PHRASES_ACTION, SHOW_LOADING_MESSAGES
+    PHRASES_SEARCH, PHRASES_HYBRID, PHRASES_ACTION, SHOW_LOADING_MESSAGES,
+    PHRASES_PARSING, PHRASES_QUEUE
 )
+
+
 from context_builder import clean_mention, build_context
 from ollama_client import ask_ollama, ask_ollama_vision
 from tools import search_web
@@ -219,7 +222,7 @@ async def read_image_attachments(
 # Set up logging for the bot
 logger = logging.getLogger(__name__)
 
-async def rotate_status(loading_msg: discord.Message, phrases: list):
+async def rotate_status(loading_msg: discord.Message, phrases: list, prefix: str = "> ⏳ ***"):
     """
     Background task to rotate loading phrases if generation takes a while.
     Silently exits when SHOW_LOADING_MESSAGES is disabled.
@@ -235,10 +238,9 @@ async def rotate_status(loading_msg: discord.Message, phrases: list):
     used_phrases = set()
     try:
         while True:
-            # Wait before changing the message. 
-            # This ensures the initial phrase stays on screen for a bit, 
-            # and spaces out subsequent rotations nicely.
-            await asyncio.sleep(random.uniform(6, 10))
+            # Wait before changing the message (wait less if we have many many phrases)
+            sleep_time = random.uniform(5, 8) if len(phrases) < 10 else random.uniform(4, 6)
+            await asyncio.sleep(sleep_time)
             
             # Pick a new phrase not just used
             available = [p for p in phrases if p not in used_phrases]
@@ -248,11 +250,17 @@ async def rotate_status(loading_msg: discord.Message, phrases: list):
                 
             phrase = random.choice(available)
             used_phrases.add(phrase)
-            await loading_msg.edit(content=f"> ⏳ ***{phrase}***")
+            try:
+                await loading_msg.edit(content=f"{prefix}{phrase}***")
+            except discord.NotFound:
+                break # Message deleted, stop rotating
+            except Exception:
+                pass # Ignore transient edit errors
     except asyncio.CancelledError:
         pass
     except Exception as e:
         logger.error(f"Error in status rotation: {e}")
+
 
 async def status_loop(bot: discord.Client):
     """
@@ -313,7 +321,7 @@ class PromptQueue:
         logger.info("Starting PromptQueue worker...")
         self.worker_task = asyncio.create_task(self._worker())
 
-    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self, history=None, user_info=None, other_users_info=None, attachments_text=None, images_text=None):
+    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self, history=None, user_info=None, other_users_info=None, attachments_text=None, images_text=None, status_task=None):
         if user_id in self.active_user_ids:
             logger.warning(f"User {user_id} already has an active task. Put rejected.")
             return False, 0
@@ -334,10 +342,12 @@ class PromptQueue:
             "other_users_info": other_users_info,
             "attachments_text": attachments_text,
             "images_text": images_text,
+            "status_task": status_task,
         }
         
         await self.queue.put((user_id, task_data))
         return True, pos
+
 
     async def _worker(self):
         logger.info("PromptQueue worker thread entered _worker loop.")
@@ -367,7 +377,9 @@ class PromptQueue:
                     task_data.get("other_users_info"),
                     task_data.get("attachments_text"),
                     task_data.get("images_text"),
+                    task_data.get("status_task")
                 )
+
                 logger.info(f"PromptQueue: Successfully processed user {user_id}'s task.")
             except Exception as e:
                 logger.error(f"PromptQueue: ERROR for user {current_user_id}: {e}", exc_info=True)
@@ -582,6 +594,8 @@ class GeminiSelfBot(discord.Client):
         self.ollama_http_client = ollama_http_client
         self.start_time = int(time.time() * 1000)
         self.prompt_queue = PromptQueue(self)
+        self.reminder_loop_started = False
+
 
     async def on_ready(self):
         # Set online status
@@ -589,9 +603,12 @@ class GeminiSelfBot(discord.Client):
         init_db()
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
         logger.info("Self-bot is ready and listening for mentions/replies (Status: Online).")
-        self.loop.create_task(self.reminder_loop())
         self.loop.create_task(status_loop(self))
+        if not self.reminder_loop_started:
+            self.loop.create_task(self.reminder_loop())
+            self.reminder_loop_started = True
         self.prompt_queue.start()
+
 
     async def reminder_loop(self):
         await self.wait_until_ready()
@@ -602,11 +619,28 @@ class GeminiSelfBot(discord.Client):
                     try:
                         channel = self.get_channel(r['channel_id']) or await self.fetch_channel(r['channel_id'])
                         if channel:
-                            msg = await channel.fetch_message(r['message_id'])
-                            await msg.reply(f"> ⏰ **Reminder:** {r['topic']}")
-                        delete_reminder(r['id'])
+                            try:
+                                msg = await channel.fetch_message(r['message_id'])
+                                await msg.reply(f"> ⏰ **Reminder:** {r['topic']}")
+                                delete_reminder(r['id'])
+                            except discord.NotFound:
+                                # Message was deleted - can't reply, so just send a normal message if possible
+                                logger.warning(f"Reminder {r['id']}: Original message {r['message_id']} not found. Sending to channel instead.")
+                                await channel.send(f"> ⏰ **Reminder:** {r['topic']}\n*(Note: The message I was supposed to reply to was deleted)*")
+                                delete_reminder(r['id'])
+                            except discord.Forbidden:
+                                logger.error(f"Reminder {r['id']}: Forbidden from replying to message in channel {r['channel_id']}.")
+                                # Depending on policy, we might want to delete it or leave it. 
+                                # Let's delete it so it doesn't spam the log.
+                                delete_reminder(r['id'])
+                        else:
+                            logger.error(f"Reminder {r['id']}: Could not find channel {r['channel_id']}.")
+                            # If we can't find the channel at all, it's likely gone or we lost access.
+                            # Delete it to avoid infinite looping.
+                            delete_reminder(r['id'])
                     except Exception as e:
-                        logger.error(f"Failed to send reminder {r['id']}: {e}")
+                        logger.error(f"Failed to process reminder {r['id']}: {e}")
+
             except Exception as e:
                 logger.error(f"Error in reminder_loop: {e}")
             
@@ -660,34 +694,6 @@ class GeminiSelfBot(discord.Client):
         user_prompt = clean_mention(message.content, self.user.id)
         
         # Handle file attachments (before we decide whether to proceed)
-        attachments_text = None
-        images_text = None
-        loading_msg = None  # Will be set below; image processing may claim it first
-        if message.attachments:
-            # Text files
-            text_atts = [a for a in message.attachments if os.path.splitext(a.filename)[1].lower() not in ALLOWED_IMAGE_EXTENSIONS]
-            if text_atts:
-                attachments_text, att_error = await read_text_attachments(text_atts)
-                if att_error:
-                    await message.reply(f"> {att_error}")
-                    return
-                if attachments_text:
-                    logger.info(f"Loaded {len(text_atts)} text attachment(s) from {message.author}")
-
-            # Image files
-            image_atts = [a for a in message.attachments if os.path.splitext(a.filename)[1].lower() in ALLOWED_IMAGE_EXTENSIONS]
-            if image_atts:
-                images_text = "The following images were attached:\n"
-                for i, att in enumerate(image_atts):
-                    images_text += f"- [{i}] {att.filename} ({att.size // 1024} KB)\n"
-                images_text += "\n[CRITICAL INSTRUCTION: You cannot see this image yet. To view it, you MUST output the exact string `[ACTION: analyze_images(\"vision\")]` or `[ACTION: analyze_images(\"ocr\")]` in your response.]"
-                logger.info(f"Detected {len(image_atts)} image(s) from {message.author}")
-
-        # If no prompt text is found, only proceed if it's a reply or has attachments
-        is_reply = message.reference is not None
-        if not user_prompt and not is_reply and not attachments_text and not images_text:
-            return
-
         # Core Safety Guardrail
         # Deny obvious malicious patterns immediately to save compute
         is_safe, refusal_reason = is_safe_prompt(user_prompt)
@@ -696,11 +702,69 @@ class GeminiSelfBot(discord.Client):
             await message.reply(f"> 🛡️ **Guardrail Triggered:** {refusal_reason}\nI cannot fulfill this request.")
             return
 
-        # Display initial loading state (only if not already set by image processing above)
-        if loading_msg is None:
+        # Initialize context containers
+        attachments_text = None
+        images_text = None
+        loading_msg = None
+
+        # 1. Identify all attachments (Current Message)
+        all_attachments = list(message.attachments)
+        
+        # 2. Identify all attachments (Replied Message)
+        ref_msg = None
+        if message.reference:
+            try:
+                ref_msg = message.reference.cached_message or await message.channel.fetch_message(message.reference.message_id)
+                if ref_msg and ref_msg.attachments:
+                    all_attachments.extend(ref_msg.attachments)
+            except discord.HTTPException:
+                pass
+
+        # 3. Handle Text Attachments
+        text_atts = [a for a in all_attachments if os.path.splitext(a.filename)[1].lower() in ALLOWED_TEXT_EXTENSIONS]
+        if text_atts:
+            attachments_text, att_error = await read_text_attachments(text_atts)
+            if att_error:
+                await message.reply(f"> {att_error}")
+                return
+            if attachments_text:
+                logger.info(f"Loaded {len(text_atts)} text attachment(s)")
+
+        # 4. Handle Image Attachments (Automatic Vision/OCR)
+        image_atts = [a for a in all_attachments if os.path.splitext(a.filename)[1].lower() in ALLOWED_IMAGE_EXTENSIONS]
+        if image_atts:
+            # Create loading message early for image processing feedback
             if SHOW_LOADING_MESSAGES:
-                loading_msg = await message.reply("> ⏳ ***Parsing intent...***")
-            # else: loading_msg stays None — we reply directly at the end
+                loading_msg = await message.reply("> 🖼️ ***Analyzing attached images...***")
+            
+            # Run vision model automatically
+            img_obs, img_err = await read_image_attachments(image_atts, self.ollama_http_client, loading_msg, method="vision")
+            if img_err:
+                err_text = f"> ❌ **Image Analysis Failed:** {img_err}"
+                if loading_msg: await loading_msg.edit(content=err_text)
+                else: await message.reply(err_text)
+                return
+            
+            images_text = f"[Image Analysis Attachment]:\n{img_obs}"
+            logger.info(f"Automatically analyzed {len(image_atts)} image(s)")
+
+        # 5. Early exit if no content to process
+        is_reply = message.reference is not None
+        if not user_prompt and not is_reply and not attachments_text and not images_text:
+            return
+
+        # 6. Display final loading state if not already set by image processing
+        status_task = None
+        if loading_msg is None and SHOW_LOADING_MESSAGES:
+            loading_msg = await message.reply(f"> ⏳ ***{random.choice(PHRASES_PARSING)}***")
+            status_task = asyncio.create_task(rotate_status(loading_msg, PHRASES_PARSING))
+        elif loading_msg and SHOW_LOADING_MESSAGES:
+            # If image analysis was already running, start rotating parsing phrases
+            status_task = asyncio.create_task(rotate_status(loading_msg, PHRASES_PARSING))
+
+
+
+
 
         # 5. Fetch Channel History (Context awareness)
         history = []
@@ -756,7 +820,9 @@ class GeminiSelfBot(discord.Client):
             other_users_info=other_users_info,
             attachments_text=attachments_text,
             images_text=images_text,
+            status_task=status_task,
         )
+
 
         if not success:
             err_text = "> ❌ **Queue Full:** You already have an active prompt being processed or in the queue."
@@ -767,12 +833,19 @@ class GeminiSelfBot(discord.Client):
             return
 
         if position > 0 and loading_msg:
+            if status_task:
+                status_task.cancel()
             await loading_msg.edit(content=f"> ⏳ ***Queued (Position #{position})...***")
+            status_task = asyncio.create_task(rotate_status(loading_msg, PHRASES_QUEUE, prefix=f"> ⏳ ***Queued (Pos #{position}) | "))
+            # Update the task in task_data (we need to update the entry in the queue, but that's hard)
+            # Actually, put has already happened.
+            # I should update the dictionary in task_data.
+
             logger.info(f"on_message: User {message.author.id} queued at pos {position}")
         else:
             logger.info(f"on_message: User {message.author.id} added at pos 0 (Immediate Processing)")
 
-    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool, history: list, user_info: dict, other_users_info: list | None = None, attachments_text: str | None = None, images_text: str | None = None):
+    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool, history: list, user_info: dict, other_users_info: list | None = None, attachments_text: str | None = None, images_text: str | None = None, status_task: asyncio.Task | None = None):
         """
         Agentic loop allowing the main model to decide if it needs tools, thinking, or direct answer.
         """
@@ -826,8 +899,7 @@ class GeminiSelfBot(discord.Client):
         force_search = is_market_query
         
         curr_phrases = PHRASES_DEFAULT
-        status_task = None
-        
+        # Use inherited status_task if provided
         # Step A: Proactive Search (if triggered by keywords)
         if force_search:
             logger.info(f"Force Search triggered. Refining query for: '{user_prompt}'")
@@ -851,9 +923,8 @@ class GeminiSelfBot(discord.Client):
         # --- AGENTIC REACT LOOP ---
         iteration = 0
         max_iterations = 4
-        think_enabled = False
-        curr_phrases = PHRASES_DEFAULT
-        status_task = None
+        # think_enabled is already set above
+        # curr_phrases is already set above
         executed_tools = set() # Track to avoid infinite loops
         
         while iteration < max_iterations:
@@ -884,9 +955,10 @@ class GeminiSelfBot(discord.Client):
                 # 2. Forced Search (Iteration 1 only)
                 if iteration == 1 and force_search:
                     logger.info("Force Search triggered by flag.")
+                    curr_phrases = PHRASES_HYBRID if think_enabled else PHRASES_SEARCH
                     if SHOW_LOADING_MESSAGES:
-                        await loading_msg.edit(content=f"> 🔍 ***{random.choice(PHRASES_SEARCH)}***")
-                    curr_phrases = PHRASES_SEARCH
+                        await loading_msg.edit(content=f"> 🔍 ***{random.choice(curr_phrases)}***")
+
                     search_results = await search_web(user_prompt, client=self.ollama_http_client)
                     increment_stats(searches=1)
                     context = "\n".join([f"- {r['title']}: {r['snippet']}" for r in search_results.get('results', [])])
@@ -898,7 +970,9 @@ class GeminiSelfBot(discord.Client):
                 if "[MODE: think]" in response and not think_enabled:
                     logger.info("Model requested Thinking Mode.")
                     think_enabled = True
-                    curr_phrases = PHRASES_THINK
+                    # If we were searching, move to Hybrid. Otherwise move to Think.
+                    curr_phrases = PHRASES_HYBRID if curr_phrases in (PHRASES_SEARCH, PHRASES_ACTION) else PHRASES_THINK
+
                     clean_resp = response.replace("[MODE: think]", "").strip()
                     if clean_resp:
                         messages.append({"role": "assistant", "content": clean_resp})
@@ -924,6 +998,12 @@ class GeminiSelfBot(discord.Client):
                     logger.info(f"Model triggered tool: {tool_name}({tool_args})")
                     executed_tools.add(tool_id)
                     
+                    # Update phrases for the next iteration (rotation will pick it up)
+                    if tool_name == "search_web" or tool_name == "search":
+                        curr_phrases = PHRASES_HYBRID if think_enabled else PHRASES_SEARCH
+                    else:
+                        curr_phrases = PHRASES_HYBRID if think_enabled else PHRASES_ACTION
+
                     tool_result = await self._dispatch_tool(tool_name, tool_args, message, loading_msg)
                     
                     if tool_result == "HANDLED_UI":
@@ -932,8 +1012,8 @@ class GeminiSelfBot(discord.Client):
                         
                     messages.append({"role": "assistant", "content": response})
                     messages.append({"role": "user", "content": f"[TOOL_RESULT]: {tool_result}"})
-                    curr_phrases = PHRASES_ACTION if tool_name != "search" else PHRASES_SEARCH
                     continue
+
 
                 # 5. Final Response
                 status_task.cancel()
@@ -1046,18 +1126,51 @@ class GeminiSelfBot(discord.Client):
                     
             elif name == "reminder":
                 # Expecting format: seconds, "topic"
-                parts = [p.strip(' "') for p in clean_args.split(",")]
-                secs = int(parts[0]) if parts[0].isdigit() else 60
-                topic = parts[1] if len(parts) > 1 else "Reminder"
-                trigger = int(time.time()) + secs
-                add_reminder(message.channel.id, message.id, trigger, topic)
-                reply_text = f"> ⏰ **Timer Set:** I will remind you accurately in {secs} seconds."
-                if loading_msg:
-                    await loading_msg.edit(content=reply_text)
-                else:
-                    await message.reply(reply_text)
-                increment_stats(tools=1, messages=1)
-                return "HANDLED_UI"
+                # We use a more robust split to allow commas in the topic
+                try:
+                    # Look for first comma that separates seconds from topic
+                    first_comma = clean_args.find(',')
+                    if first_comma != -1:
+                        secs_str = clean_args[:first_comma].strip(' "')
+                        topic = clean_args[first_comma+1:].strip(' "')
+                    else:
+                        secs_str = clean_args.strip(' "')
+                        topic = "Reminder"
+
+                    # Support math expressions in seconds (e.g. 4*60*60)
+                    if not secs_str.isdigit():
+                        from tools import calculate_math
+                        math_res = await calculate_math(secs_str)
+                        if math_res['status'] == 'success':
+                            # result could be float or int
+                            secs = int(float(math_res['result']))
+                        else:
+                            secs = 60 # Default fallback
+                    else:
+                        secs = int(secs_str)
+
+                    trigger = int(time.time()) + secs
+                    add_reminder(message.channel.id, message.id, trigger, topic)
+                    
+                    # Human-readable time
+                    if secs >= 3600:
+                        time_desc = f"{secs/3600:.1f} hours"
+                    elif secs >= 60:
+                        time_desc = f"{secs/60:.1f} minutes"
+                    else:
+                        time_desc = f"{secs} seconds"
+
+                    reply_text = f"> ⏰ **Timer Set:** I will remind you in **{time_desc}** (at <t:{trigger}:T>)."
+                    if loading_msg:
+                        await loading_msg.edit(content=reply_text)
+                    else:
+                        await message.reply(reply_text)
+                    increment_stats(tools=1, messages=1)
+                    return "HANDLED_UI"
+                except Exception as e:
+                    logger.error(f"Error setting reminder: {e}")
+                    return f"Error setting reminder: {e}"
+
                 
             elif name == "memory_save":
                 # Expecting format: "key", "value"
