@@ -28,11 +28,69 @@ def build_context(user_prompt: str, reply_context: str | None = None, is_reply_t
         profile_parts = [
             f"Display Name: {info.get('display_name')}",
             f"Username: {info.get('username')}",
+        ]
+
+        # Global display name (if different from username)
+        global_name = info.get('global_name')
+        if global_name:
+            profile_parts.append(f"Global Name: {global_name}")
+
+        profile_parts += [
             f"ID: {info.get('id')}",
             f"Account Created: {info.get('created_at')}",
             f"Server: {info.get('server_name')}",
         ]
-        
+
+        # Server-specific fields (only present for Members)
+        nick = info.get('server_nickname')
+        if nick:
+            profile_parts.append(f"Server Nickname: {nick}")
+
+        joined = info.get('joined_server_at')
+        if joined:
+            profile_parts.append(f"Joined Server: {joined}")
+
+        top_role = info.get('top_role')
+        if top_role:
+            profile_parts.append(f"Top Role: {top_role}")
+
+        roles = info.get('server_roles')
+        if roles:
+            profile_parts.append(f"Server Roles: {', '.join(roles)}")
+
+        role_colour = info.get('role_colour')
+        if role_colour:
+            profile_parts.append(f"Role Colour: {role_colour}")
+
+        booster = info.get('server_booster_since')
+        if booster:
+            profile_parts.append(f"Server Booster Since: {booster}")
+
+        timed_out = info.get('timed_out_until')
+        if timed_out:
+            profile_parts.append(f"⚠️ Timed Out Until: {timed_out}")
+
+        perms = info.get('guild_permissions')
+        if perms:
+            flagged = [k.replace('_', ' ').title() for k, v in perms.items() if v]
+            if flagged:
+                profile_parts.append(f"Notable Permissions: {', '.join(flagged)}")
+
+        # Online presence
+        online = info.get('online_status')
+        if online:
+            profile_parts.append(f"Online Status: {online}")
+        for device in ('desktop_status', 'mobile_status', 'web_status'):
+            val = info.get(device)
+            if val and val != 'offline':
+                profile_parts.append(f"{device.replace('_', ' ').title()}: {val}")
+
+        # Activities / Rich Presence
+        activities = info.get('activities') or info.get('status')   # handle old key gracefully
+        if activities:
+            profile_parts.append(f"Activities: {', '.join(activities)}")
+
+        # Profile / Nitro
         bio = info.get('bio')
         if bio:
             profile_parts.append(f"About Me (Bio): {bio}")
@@ -41,30 +99,45 @@ def build_context(user_prompt: str, reply_context: str | None = None, is_reply_t
         if pronouns:
             profile_parts.append(f"Pronouns: {pronouns}")
 
-        nitro = info.get('premium_since')
-        if nitro:
-            profile_parts.append(f"Nitro/Boost Status (Tag): Active since {nitro}")
-            
-        roles = info.get('server_roles')
-        if roles:
-            profile_parts.append(f"Server Roles: {', '.join(roles)}")
-            
-        status = info.get('status')
-        if status:
-            profile_parts.append(f"Active Status: {', '.join(status)}")
+        # Nitro — prefer new keys, fall back to old key
+        nitro_since = info.get('nitro_since') or info.get('premium_since')
+        nitro_type  = info.get('nitro_type')
+        if nitro_since:
+            label = f"Nitro ({nitro_type})" if nitro_type and nitro_type != "None" else "Nitro"
+            profile_parts.append(f"{label} since: {nitro_since}")
+
+        banner = info.get('banner_url')
+        if banner:
+            profile_parts.append(f"Banner: {banner}")
+
+        accent = info.get('accent_colour')
+        if accent:
+            profile_parts.append(f"Accent Colour: {accent}")
+
+        avatar = info.get('avatar_url')
+        if avatar:
+            profile_parts.append(f"Avatar: {avatar}")
 
         connections = info.get('connections')
         if connections:
             profile_parts.append(f"Connected Accounts: {', '.join(connections)}")
 
+        mutual_guilds = info.get('mutual_guild_count')
+        if mutual_guilds is not None:
+            profile_parts.append(f"Mutual Servers: {mutual_guilds}")
+
+        mutual_friends = info.get('mutual_friend_count')
+        if mutual_friends is not None:
+            profile_parts.append(f"Mutual Friends: {mutual_friends}")
+
         recent = info.get('recent_activity')
         if recent and recent != "None":
             profile_parts.append(f"Recent Activity: {recent}")
 
-        game_board = info.get('game_board')
+        game_board = info.get('game_leaderboard') or info.get('game_board')
         if game_board and game_board != "None":
-            profile_parts.append(f"Game Board / Leaderboards: {game_board}")
-            
+            profile_parts.append(f"Game Leaderboards: {game_board}")
+
         return f"{label_str}:\n" + "\n".join(profile_parts)
 
     if user_info:

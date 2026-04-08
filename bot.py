@@ -52,7 +52,7 @@ BLOCKED_EXTENSIONS: set[str] = {
     ".mp3", ".mp4", ".wav", ".flac", ".ogg", ".avi", ".mkv", ".mov",
 }
 
-MAX_ATTACHMENT_BYTES = 200_000  # 200 KB per file
+MAX_ATTACHMENT_BYTES = 40_000  # Bytes per file
 MAX_ATTACHMENT_FILES = 5
 
 # Image attachments — handled via vision model or OCR, not the text pipeline
@@ -381,48 +381,198 @@ class PromptQueue:
                 else:
                     logger.warning("PromptQueue: Worker iteration finished without a valid user_id.")
 
-async def extract_user_metadata(user: discord.User, guild: discord.Guild) -> dict:
-    user_info = {
-        "display_name": getattr(user, "display_name", str(user)),
-        "username": str(user),
-        "id": user.id,
-        "created_at": user.created_at.strftime("%Y-%m-%d"),
-        "server_name": guild.name if guild else "Direct Message",
-        "server_roles": [r.name for r in user.roles if r.name != "@everyone"] if hasattr(user, "roles") else []
+async def extract_user_metadata(user: discord.User | discord.Member, guild: discord.Guild | None) -> dict:
+    """
+    Extract as much publicly available metadata as possible for a Discord user/member.
+    Handles both discord.User (DMs / minimal info) and discord.Member (full guild context).
+    """
+    # ── Base identity ────────────────────────────────────────────────────────
+    user_info: dict = {
+        "display_name":  getattr(user, "display_name", str(user)),
+        "username":      str(user),
+        "global_name":   getattr(user, "global_name", None),
+        "id":            user.id,
+        "bot":           user.bot,
+        "system":        getattr(user, "system", False),
+        "created_at":    user.created_at.strftime("%Y-%m-%d %H:%M UTC"),
+        "avatar_url":    str(user.display_avatar.url) if user.display_avatar else None,
     }
-    
-    status_list = []
+
+    # ── Online presence ──────────────────────────────────────────────────────
+    raw_status = getattr(user, "status", None)
+    if raw_status is not None:
+        user_info["online_status"] = str(raw_status)          # online / idle / dnd / offline
+    raw_mobile = getattr(user, "mobile_status", None)
+    if raw_mobile is not None:
+        user_info["mobile_status"] = str(raw_mobile)
+    raw_desktop = getattr(user, "desktop_status", None)
+    if raw_desktop is not None:
+        user_info["desktop_status"] = str(raw_desktop)
+    raw_web = getattr(user, "web_status", None)
+    if raw_web is not None:
+        user_info["web_status"] = str(raw_web)
+
+    # ── Guild-member specific ────────────────────────────────────────────────
+    user_info["server_name"] = guild.name if guild else "Direct Message"
+
+    if isinstance(user, discord.Member):
+        user_info["server_nickname"] = user.nick                               # May be None
+        user_info["joined_server_at"] = (
+            user.joined_at.strftime("%Y-%m-%d %H:%M UTC") if user.joined_at else None
+        )
+        user_info["server_roles"] = [r.name for r in user.roles if r.name != "@everyone"]
+        user_info["top_role"]     = user.top_role.name if user.top_role else None
+        user_info["server_booster_since"] = (
+            user.premium_since.strftime("%Y-%m-%d") if user.premium_since else None
+        )
+        user_info["pending_membership_screening"] = user.pending
+        timed_out = getattr(user, "timed_out_until", None)
+        user_info["timed_out_until"] = timed_out.strftime("%Y-%m-%d %H:%M UTC") if timed_out else None
+        # Guild avatar (separate from global avatar)
+        guild_av = getattr(user, "guild_avatar", None)
+        user_info["server_avatar_url"] = str(guild_av.url) if guild_av else None
+        # Colour from top coloured role
+        colour = user.colour
+        if colour != discord.Colour.default():
+            user_info["role_colour"] = str(colour)
+        # Key guild permissions (non-exhaustive but informative)
+        try:
+            perms = user.guild_permissions
+            user_info["guild_permissions"] = {
+                "administrator":     perms.administrator,
+                "manage_guild":      perms.manage_guild,
+                "manage_channels":   perms.manage_channels,
+                "manage_roles":      perms.manage_roles,
+                "manage_messages":   perms.manage_messages,
+                "kick_members":      perms.kick_members,
+                "ban_members":       perms.ban_members,
+                "moderate_members":  perms.moderate_members,
+                "mention_everyone":  perms.mention_everyone,
+            }
+        except Exception:
+            pass
+    else:
+        user_info["server_roles"]  = []
+        user_info["top_role"]      = None
+
+    # ── Activities / Rich Presence ───────────────────────────────────────────
+    status_list: list[str] = []
     if hasattr(user, "activities"):
         for activity in user.activities:
             try:
-                if activity.type == discord.ActivityType.listening:
-                    status_list.append(f"Listening to: {activity.name} - {getattr(activity, 'title', 'Unknown')} by {getattr(activity, 'artist', 'Unknown')}")
-                elif activity.type == discord.ActivityType.playing:
-                    status_list.append(f"Playing: {activity.name}")
-                elif activity.type == discord.ActivityType.streaming:
-                    status_list.append(f"Streaming: {activity.name} on {activity.platform}")
-                elif activity.type == discord.ActivityType.custom:
-                    status_list.append(f"Status: {activity.name}")
-            except:
-                continue
-    user_info["status"] = status_list
+                atype = activity.type
+                name  = getattr(activity, "name", "Unknown")
 
+                if atype == discord.ActivityType.listening:
+                    # Spotify and generic listening
+                    title   = getattr(activity, "title", None)   or name
+                    artist  = getattr(activity, "artist", None)  or "Unknown Artist"
+                    album   = getattr(activity, "album", None)
+                    track_url = getattr(activity, "track_url", None)
+                    entry = f"Listening to: {title} by {artist}"
+                    if album:
+                        entry += f" (Album: {album})"
+                    if track_url:
+                        entry += f" — {track_url}"
+                    status_list.append(entry)
+
+                elif atype == discord.ActivityType.playing:
+                    details = getattr(activity, "details", None)
+                    state   = getattr(activity, "state",   None)
+                    ts    = getattr(activity, "timestamps", None)
+                    start = getattr(ts, "start", None) if ts else None
+                    entry = f"Playing: {name}"
+                    if details:
+                        entry += f" ({details}"
+                        if state:
+                            entry += f" — {state}"
+                        entry += ")"
+                    if start:
+                        entry += f" [since {start.strftime('%H:%M UTC')}]"
+                    status_list.append(entry)
+
+                elif atype == discord.ActivityType.streaming:
+                    platform = getattr(activity, "platform", "Unknown Platform")
+                    url      = getattr(activity, "url", None)
+                    entry = f"Streaming: {name} on {platform}"
+                    if url:
+                        entry += f" — {url}"
+                    status_list.append(entry)
+
+                elif atype == discord.ActivityType.watching:
+                    status_list.append(f"Watching: {name}")
+
+                elif atype == discord.ActivityType.competing:
+                    status_list.append(f"Competing in: {name}")
+
+                elif atype == discord.ActivityType.custom:
+                    # Custom status has emoji + state text
+                    emoji = getattr(activity, "emoji", None)
+                    state = getattr(activity, "state", None)
+                    parts = []
+                    if emoji:
+                        parts.append(str(emoji))
+                    if state:
+                        parts.append(state)
+                    elif name and name != "Custom Status":
+                        parts.append(name)
+                    if parts:
+                        status_list.append("Custom status: " + " ".join(parts))
+
+            except Exception:
+                continue
+
+    user_info["activities"] = status_list
+
+    # ── User Profile (requires an API call; may fail for non-friends/privacy) ──
     try:
         profile = await user.profile()
-        user_info["bio"] = getattr(profile, "bio", None)
-        user_info["pronouns"] = getattr(profile, "pronouns", None)
-        user_info["premium_since"] = profile.premium_since.strftime("%Y-%m-%d") if getattr(profile, "premium_since", None) else None
-        user_info["connections"] = [f"{c.type}: {c.name}" for c in profile.connected_accounts] if hasattr(profile, "connected_accounts") else []
+        user_info["bio"]           = getattr(profile, "bio", None)
+        user_info["pronouns"]      = getattr(profile, "pronouns", None)
+
+        prof_premium = getattr(profile, "premium_since", None)
+        user_info["nitro_since"]   = prof_premium.strftime("%Y-%m-%d") if prof_premium else None
+
+        # Nitro type (0=none, 1=classic, 2=full, 3=basic)
+        nitro_type = getattr(profile, "premium_type", None)
+        if nitro_type is not None:
+            _nitro_labels = {0: "None", 1: "Nitro Classic", 2: "Nitro", 3: "Nitro Basic"}
+            user_info["nitro_type"] = _nitro_labels.get(int(nitro_type), str(nitro_type))
+
+        # Banner
+        banner = getattr(profile, "banner", None) or getattr(user, "banner", None)
+        user_info["banner_url"] = str(banner.url) if banner else None
+
+        # Accent colour
+        accent = getattr(profile, "accent_colour", None) or getattr(user, "accent_colour", None)
+        user_info["accent_colour"] = str(accent) if accent else None
+
+        # Connected accounts
+        connected = getattr(profile, "connected_accounts", [])
+        user_info["connections"] = [f"{c.type}: {c.name}" for c in connected] if connected else []
+
+        # Mutual guilds / friends (available when fetching someone else's profile)
+        mutual_guilds = getattr(profile, "mutual_guilds", None)
+        if mutual_guilds is not None:
+            user_info["mutual_guild_count"] = len(mutual_guilds)
+
+        mutual_friends = getattr(profile, "mutual_friends", None)
+        if mutual_friends is not None:
+            user_info["mutual_friend_count"] = len(mutual_friends)
+
+        # Recent activity & leaderboards
         recent = getattr(profile, "user_recent_activity", None)
-        user_info["recent_activity"] = str(recent) if recent else "None"
+        user_info["recent_activity"] = str(recent) if recent else None
+
         leaderboards = getattr(profile, "leaderboards", None)
-        user_info["game_board"] = str(leaderboards) if leaderboards else "None"
+        user_info["game_leaderboard"] = str(leaderboards) if leaderboards else None
+
     except Exception as e:
         logger.debug(f"Could not fetch profile for {user}: {e}")
-        user_info["bio"] = None
-        user_info["connections"] = []
-        user_info["recent_activity"] = "None"
-        user_info["game_board"] = "None"
+        user_info.setdefault("bio",             None)
+        user_info.setdefault("connections",     [])
+        user_info.setdefault("recent_activity", None)
+
     return user_info
 
 
