@@ -8,7 +8,7 @@ from config import (
     PHRASES_SEARCH, PHRASES_HYBRID, PHRASES_ACTION, SHOW_LOADING_MESSAGES
 )
 from context_builder import clean_mention, build_context
-from ollama_client import ask_ollama, ask_ollama_json, ask_ollama_vision
+from ollama_client import ask_ollama, ask_ollama_vision
 from tools import search_web
 from guardrails import is_safe_prompt
 from database import init_db, add_reminder, get_due_reminders, delete_reminder, save_memory, get_memories, increment_stats, get_stats
