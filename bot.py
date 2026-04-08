@@ -811,9 +811,10 @@ class GeminiSelfBot(discord.Client):
         """
         import re
         
-        # Clean up any leaked system tags the LLM might hallucinate
-        content = re.sub(r'\[(?i:tool_result|system|sys)\]:?\s*', '', content)
-        content = content.strip()
+        # Clean up any leaked system tags or headers the LLM might hallucinate
+        # Catches: [TOOL_RESULT], [system], ### [REPLIED TO CONTEXT]:, ### [USER PROMPT]:
+        content = re.sub(r'(?:###\s*)?\[(?i:tool_result|system|sys|replied to context|user prompt(?: end)?)\]:?\s*', '', content)
+        content = content.replace("### :", "").strip() # Edge case cleanup
 
         # Pre-process content: strip out redundant protocol from markdown link display text
         # e.g., converts [https://tx24.is-a.dev/](https://tx24.is-a.dev/) to [tx24.is-a.dev](https://tx24.is-a.dev/)
