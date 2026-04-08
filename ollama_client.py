@@ -1,7 +1,7 @@
 import httpx
 import logging
 import base64
-from config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_ROUTER_MODEL, OLLAMA_NUM_CTX, OLLAMA_VISION_MODEL, VISION_NUM_GPU
+from config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_NUM_CTX, OLLAMA_VISION_MODEL, VISION_NUM_GPU
 from database import increment_stats
 
 logger = logging.getLogger(__name__)
