@@ -31,31 +31,27 @@ ALLOWED_TEXT_EXTENSIONS: set[str] = {
     ".toml", ".ini", ".cfg", ".conf", ".env",
     ".xml", ".html", ".htm", ".css",
     ".diff", ".patch", ".ttml",
-}
-
-# Hard block list – anything that can be executed or is a binary container.
-# This is belt-and-suspenders on top of the allow-list.
-BLOCKED_EXTENSIONS: set[str] = {
-    ".py", ".pyw", ".pyc", ".pyo",
-    ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+    # Programming Languages & Scripts
+    ".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
     ".sh", ".bash", ".zsh", ".fish", ".ksh", ".csh",
-    ".bat", ".cmd", ".ps1", ".psm1", ".psd1",
-    ".exe", ".dll", ".so", ".dylib", ".elf",
-    ".bin", ".out", ".run",
-    ".rb", ".rbw", ".pl", ".pm", ".php", ".phtml",
-    ".lua", ".r", ".rscript",
-    ".java", ".class", ".jar", ".war", ".ear",
     ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp",
     ".cs", ".go", ".rs", ".swift", ".kt", ".kts",
-    ".vbs", ".vb", ".wsf",
+    ".rb", ".rbw", ".pl", ".pm", ".php", ".phtml",
+    ".lua", ".r", ".rscript", ".java", ".sql", ".dart",
+}
+
+# Hard block list – binaries, compiled code, or containers.
+# This ensures the bot doesn't attempt to read non-text data.
+BLOCKED_EXTENSIONS: set[str] = {
+    ".pyc", ".pyo", ".class", ".jar", ".war", ".ear",
+    ".exe", ".dll", ".so", ".dylib", ".elf", ".bin", ".out", ".run",
     ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
     ".iso", ".img", ".dmg",
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".bmp", ".svg", ".ico",  # Images go through vision pipeline, not blocked
     ".mp3", ".mp4", ".wav", ".flac", ".ogg", ".avi", ".mkv", ".mov",
 }
 
-MAX_ATTACHMENT_BYTES = 40_000  # Bytes per file
+MAX_ATTACHMENT_BYTES = 50_000  # Bytes per file
 MAX_ATTACHMENT_FILES = 5
 
 # Image attachments — handled via vision model or OCR, not the text pipeline
@@ -251,6 +247,9 @@ async def rotate_status(loading_msg: discord.Message, phrases: list, prefix: str
                 
             phrase = random.choice(available)
             used_phrases.add(phrase)
+            
+            # CRITICAL: Do not edit if we were cancelled during the sleep
+            # This prevents "zombie" edits from overwriting the final answer.
             try:
                 await loading_msg.edit(content=f"{prefix}{phrase}***")
             except discord.NotFound:
@@ -258,9 +257,19 @@ async def rotate_status(loading_msg: discord.Message, phrases: list, prefix: str
             except Exception:
                 pass # Ignore transient edit errors
     except asyncio.CancelledError:
+        # Task was cancelled, exit quietly
         pass
     except Exception as e:
         logger.error(f"Error in status rotation: {e}")
+
+async def safe_cancel_status(task: asyncio.Task | None):
+    """Safely cancels and awaits a status rotation task to prevent race conditions."""
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def status_loop(bot: discord.Client):
@@ -322,7 +331,7 @@ class PromptQueue:
         logger.info("Starting PromptQueue worker...")
         self.worker_task = asyncio.create_task(self._worker())
 
-    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self, history=None, user_info=None, other_users_info=None, attachments_text=None, images_text=None, status_task=None):
+    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self, history=None, user_info=None, other_users_info=None, attachments_text=None, images_text=None, status_data=None):
         if user_id in self.active_user_ids:
             logger.warning(f"User {user_id} already has an active task. Put rejected.")
             return False, 0
@@ -343,7 +352,7 @@ class PromptQueue:
             "other_users_info": other_users_info,
             "attachments_text": attachments_text,
             "images_text": images_text,
-            "status_task": status_task,
+            "status_data": status_data, # This is a dict/ref: {"task": <asyncio.Task>}
         }
         
         await self.queue.put((user_id, task_data))
@@ -378,7 +387,7 @@ class PromptQueue:
                     task_data.get("other_users_info"),
                     task_data.get("attachments_text"),
                     task_data.get("images_text"),
-                    task_data.get("status_task")
+                    task_data.get("status_data")
                 )
 
                 logger.info(f"PromptQueue: Successfully processed user {user_id}'s task.")
@@ -763,6 +772,8 @@ class GeminiSelfBot(discord.Client):
             # If image analysis was already running, start rotating parsing phrases
             status_task = asyncio.create_task(rotate_status(loading_msg, PHRASES_PARSING))
 
+        status_data = {"task": status_task}
+
 
 
 
@@ -821,7 +832,7 @@ class GeminiSelfBot(discord.Client):
             other_users_info=other_users_info,
             attachments_text=attachments_text,
             images_text=images_text,
-            status_task=status_task,
+            status_data=status_data,
         )
 
 
@@ -834,23 +845,24 @@ class GeminiSelfBot(discord.Client):
             return
 
         if position > 0 and loading_msg:
-            if status_task:
-                status_task.cancel()
+            await safe_cancel_status(status_data["task"])
             await loading_msg.edit(content=f"> ⏳ ***Queued (Position #{position})...***")
-            status_task = asyncio.create_task(rotate_status(loading_msg, PHRASES_QUEUE, prefix=f"> ⏳ ***Queued (Pos #{position}) | "))
-            # Update the task in task_data (we need to update the entry in the queue, but that's hard)
-            # Actually, put has already happened.
-            # I should update the dictionary in task_data.
+            # Update the task in the container so the worker picks up the QUEUE rotation
+            status_data["task"] = asyncio.create_task(rotate_status(loading_msg, PHRASES_QUEUE, prefix=f"> ⏳ ***Queued (Pos #{position}) | "))
+            
+            logger.info(f"on_message: User {message.author.id} queued at pos {position}")
 
             logger.info(f"on_message: User {message.author.id} queued at pos {position}")
         else:
             logger.info(f"on_message: User {message.author.id} added at pos 0 (Immediate Processing)")
 
-    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool, history: list, user_info: dict, other_users_info: list | None = None, attachments_text: str | None = None, images_text: str | None = None, status_task: asyncio.Task | None = None):
+    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool, history: list, user_info: dict, other_users_info: list | None = None, attachments_text: str | None = None, images_text: str | None = None, status_data: dict | None = None):
         """
         Agentic loop allowing the main model to decide if it needs tools, thinking, or direct answer.
         """
         logger.info(f"process_queued_prompt: Starting agentic loop for user {message.author.id}")
+        
+        status_task = status_data.get("task") if status_data else None
         
         # 1. Context Compression (Disabled for large context)
         # Bypassing slow summarization LLM calls entirely to leverage Ollama's native KV Prompt Cache for instant evaluation.
@@ -893,12 +905,19 @@ class GeminiSelfBot(discord.Client):
         # Tracking states
         think_enabled = "--think" in user_prompt.lower()
         show_stats = "--stats" in user_prompt.lower()
+        force_search_flag = "--search" in user_prompt.lower()
         
+        # Clean user prompt of internal bot flags before sending to LLM
+        # This prevents the LLM from trying to parse the flags itself or hallucinating stats.
+        for flag in ["--think", "--stats", "--search"]:
+            user_prompt = re.sub(rf"(?i){re.escape(flag)}\b", "", user_prompt)
+        user_prompt = " ".join(user_prompt.split()).strip()
+
         # PROACTIVE SEARCH HEURISTIC
         # Force a search if the user asks about something recent or market-related
-        search_keywords = ["lately", "recently", "news", "crisis", "prices", "stock", "next", "upcoming", "--search"]
+        search_keywords = ["lately", "recently", "news", "crisis", "prices", "stock", "next", "upcoming"]
         is_market_query = any(k in user_prompt.lower() for k in search_keywords)
-        force_search = is_market_query
+        force_search = is_market_query or force_search_flag
         
         curr_phrases = PHRASES_DEFAULT
         # Use inherited status_task if provided
@@ -935,8 +954,9 @@ class GeminiSelfBot(discord.Client):
             iteration += 1
             
             # Start/Restart rotation if needed
-            if status_task: status_task.cancel()
+            await safe_cancel_status(status_task)
             status_task = asyncio.create_task(rotate_status(loading_msg, curr_phrases))
+            if status_data: status_data["task"] = status_task
             
             try:
                 # 1. Call Ollama
@@ -956,7 +976,7 @@ class GeminiSelfBot(discord.Client):
                 if response.startswith("Error: "):
                     logger.error(f"Ollama Error in loop: {response}")
                     await loading_msg.edit(content=f"⚠️ **Ollama Error:** {response}")
-                    status_task.cancel()
+                    await safe_cancel_status(status_task)
                     return
 
                 # 2. Forced Search (Iteration 1 only)
@@ -1015,7 +1035,7 @@ class GeminiSelfBot(discord.Client):
                     tool_result = await self._dispatch_tool(tool_name, tool_args, message, loading_msg)
                     
                     if tool_result == "HANDLED_UI":
-                        status_task.cancel()
+                        await safe_cancel_status(status_task)
                         return
                         
                     messages.append({"role": "assistant", "content": response})
@@ -1024,13 +1044,14 @@ class GeminiSelfBot(discord.Client):
 
 
                 # 5. Final Response
-                status_task.cancel()
+                await safe_cancel_status(status_task)
+                if status_data: status_data["task"] = None
                 await self._send_safe_response(loading_msg, response, message, tokens=session_tokens, tps=last_tps, show_stats=show_stats)
                 increment_stats(messages=1)
                 return
 
             except Exception as e:
-                if status_task: status_task.cancel()
+                await safe_cancel_status(status_task)
                 logger.error(f"Error in agent loop iteration {iteration}: {e}")
                 try:
                     err_text = f"⚠️ **Error:** {str(e)[:1800]}"
