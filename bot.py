@@ -859,7 +859,7 @@ class GeminiSelfBot(discord.Client):
         # 2. Build final prompt structures
         user_info_for_context = user_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
         other_for_context = other_users_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
-        messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info_for_context, other_users_info=other_for_context)
+        messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info_for_context, other_users_info=other_for_context, bot_username=str(self.user))
 
         # Inject attachment content as a system message so the model can reason over the files
         if attachments_text:

@@ -31,7 +31,7 @@ def is_spicy_query(user_prompt: str, history: list | None = None) -> bool:
         
     return any(keyword in text_to_check for keyword in spicy_keywords)
 
-def build_context(user_prompt: str, reply_context: str | None = None, is_reply_to_self: bool = True, history: list | None = None, recap: str | None = None, user_info: dict | None = None, other_users_info: list | None = None) -> list:
+def build_context(user_prompt: str, reply_context: str | None = None, is_reply_to_self: bool = True, history: list | None = None, recap: str | None = None, user_info: dict | None = None, other_users_info: list | None = None, bot_username: str | None = None) -> list:
     """
     Construct the final list of messages for Ollama with history and optional recap.
     """
@@ -200,12 +200,26 @@ def build_context(user_prompt: str, reply_context: str | None = None, is_reply_t
         })
 
     # Add History (messages not summarized)
+    # Refactored: Interleave as User/Assistant roles for native memory ownership
     if history:
-        history_text = "\n".join([f"[{m['author']}]: {m['content']}" for m in history])
-        messages.append({
-            "role": "system",
-            "content": f"[RECENT CHANNEL HISTORY]:\n{history_text}"
-        })
+        for m in history:
+            author = m.get('author')
+            content = m.get('content', '')
+            
+            # Determine role: Is this the bot talking?
+            # Check against bot_username if provided, otherwise fallback to name-based heuristic
+            is_bot = False
+            if bot_username and author == bot_username:
+                is_bot = True
+            elif author.lower() in ("gemini", "assistant", "bot"):
+                is_bot = True
+                
+            if is_bot:
+                messages.append({"role": "assistant", "content": content})
+            else:
+                # For users, prefix with username to maintain group chat context
+                messages.append({"role": "user", "content": f"[{author}]: {content}"})
+
     
     # Construct final user content with reply context integrated
     final_user_content = ""
