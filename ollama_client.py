@@ -6,10 +6,10 @@ from database import increment_stats
 
 logger = logging.getLogger(__name__)
 
-async def ask_ollama(messages: list, think: bool = False, client: httpx.AsyncClient = None, model: str = None) -> str:
+async def ask_ollama(messages: list, think: bool = False, client: httpx.AsyncClient = None, model: str = None) -> dict:
     """
     Asynchronously ask the local Ollama instance for a response.
-    Non-streaming implementation for simplicity and correctness.
+    Returns a dict: {"content": str, "tokens": int, "tps": float}
     """
     used_model = model or OLLAMA_MODEL
     
@@ -20,7 +20,7 @@ async def ask_ollama(messages: list, think: bool = False, client: httpx.AsyncCli
     else:
         return await _call_ollama(messages, think, client, used_model)
 
-async def _call_ollama(messages: list, think: bool, client: httpx.AsyncClient, model: str) -> str:
+async def _call_ollama(messages: list, think: bool, client: httpx.AsyncClient, model: str) -> dict:
     url = f"{OLLAMA_BASE_URL}/api/chat"
     
     payload = {
@@ -52,10 +52,16 @@ async def _call_ollama(messages: list, think: bool, client: httpx.AsyncClient, m
         # Track token usage
         prompt_tokens = data.get("prompt_eval_count", 0)
         eval_tokens = data.get("eval_count", 0)
+        eval_duration_ns = data.get("eval_duration", 0)
         
-        if prompt_tokens > 0 or eval_tokens > 0:
-            logger.info(f"[CONTEXT USAGE]: Prompt: {prompt_tokens} tokens | Generation: {eval_tokens} tokens")
-            increment_stats(tokens=(prompt_tokens + eval_tokens))
+        tps = 0.0
+        if eval_duration_ns > 0:
+            tps = eval_tokens / (eval_duration_ns / 1e9)
+        
+        total_tokens = prompt_tokens + eval_tokens
+        if total_tokens > 0:
+            logger.info(f"[CONTEXT USAGE]: Prompt: {prompt_tokens} tokens | Generation: {eval_tokens} tokens | TPS: {tps:.1f}")
+            increment_stats(tokens=total_tokens)
             
         message = data.get("message", {})
         content = message.get("content", "")
@@ -63,27 +69,32 @@ async def _call_ollama(messages: list, think: bool, client: httpx.AsyncClient, m
         
         # If content is empty but we have a thought, return the thought as the content
         # so the agent loop can continue or respond.
+        final_content = content
         if not content.strip() and thought.strip():
-            return f"<thought>\n{thought}\n</thought>"
+            final_content = f"<thought>\n{thought}\n</thought>"
             
-        if not content.strip():
-            return "Error: Ollama returned an empty response."
+        if not final_content.strip():
+            return {"content": "Error: Ollama returned an empty response.", "tokens": 0, "tps": 0.0}
             
-        return content
+        return {
+            "content": final_content,
+            "tokens": total_tokens,
+            "tps": tps
+        }
         
     except httpx.ConnectError:
-        return "Error: Could not connect to Ollama. Ensure Ollama is running locally."
+        return {"content": "Error: Could not connect to Ollama. Ensure Ollama is running locally.", "tokens": 0, "tps": 0.0}
     except Exception as e:
         logger.error(f"Ollama API Error: {str(e)}")
-        return f"Error: An unexpected error occurred while calling Ollama: {str(e)}"
+        return {"content": f"Error: An unexpected error occurred while calling Ollama: {str(e)}", "tokens": 0, "tps": 0.0}
 
-async def ask_ollama_vision(image_bytes: bytes, prompt: str, client: httpx.AsyncClient | None = None) -> str:
+async def ask_ollama_vision(image_bytes: bytes, prompt: str, client: httpx.AsyncClient | None = None) -> dict:
     """
     Send an image to the configured OLLAMA_VISION_MODEL and return its description.
-    The image is passed as a base64-encoded string in the Ollama multimodal messages API.
+    Returns a dict: {"content": str, "tokens": int, "tps": float}
     """
     if not OLLAMA_VISION_MODEL:
-        return "Error: No vision model configured (OLLAMA_VISION_MODEL is empty)."
+        return {"content": "Error: No vision model configured (OLLAMA_VISION_MODEL is empty).", "tokens": 0, "tps": 0.0}
 
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
     url = f"{OLLAMA_BASE_URL}/api/chat"
@@ -102,19 +113,40 @@ async def ask_ollama_vision(image_bytes: bytes, prompt: str, client: httpx.Async
         },
     }
 
-    async def _do_request(c: httpx.AsyncClient) -> str:
+    async def _do_request(c: httpx.AsyncClient) -> dict:
         try:
             logger.info(f"Ollama Vision Request: model={OLLAMA_VISION_MODEL}")
             resp = await c.post(url, json=payload, timeout=120.0)
             resp.raise_for_status()
             data = resp.json()
+            
+            prompt_tokens = data.get("prompt_eval_count", 0)
+            eval_tokens = data.get("eval_count", 0)
+            eval_duration_ns = data.get("eval_duration", 0)
+            
+            tps = 0.0
+            if eval_duration_ns > 0:
+                tps = eval_tokens / (eval_duration_ns / 1e9)
+            
+            total_tokens = prompt_tokens + eval_tokens
+            if total_tokens > 0:
+                logger.info(f"[VISION USAGE]: Prompt: {prompt_tokens} tokens | Generation: {eval_tokens} tokens | TPS: {tps:.1f}")
+                increment_stats(tokens=total_tokens)
+
             content = data.get("message", {}).get("content", "").strip()
-            return content if content else "Error: Vision model returned an empty response."
+            if not content:
+                return {"content": "Error: Vision model returned an empty response.", "tokens": 0, "tps": 0.0}
+            
+            return {
+                "content": content,
+                "tokens": total_tokens,
+                "tps": tps
+            }
         except httpx.ConnectError:
-            return "Error: Could not connect to Ollama for vision request."
+            return {"content": "Error: Could not connect to Ollama for vision request.", "tokens": 0, "tps": 0.0}
         except Exception as e:
             logger.error(f"Ollama Vision API Error: {e}")
-            return f"Error: Vision request failed: {e}"
+            return {"content": f"Error: Vision request failed: {e}", "tokens": 0, "tps": 0.0}
 
     if client is not None:
         return await _do_request(client)

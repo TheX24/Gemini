@@ -175,7 +175,8 @@ async def read_image_attachments(
                 "If it contains text (e.g. a screenshot, document, code, log), transcribe ALL visible text exactly. "
                 "Then describe the image content, layout, and any important details."
             )
-            description = await ask_ollama_vision(image_bytes, vision_prompt, ollama_client)
+            res = await ask_ollama_vision(image_bytes, vision_prompt, ollama_client)
+            description = res.get("content", "")
             if description.startswith("Error:"):
                 return None, f"❌ **Vision model error** for `{att.filename}`: {description}"
             parts.append(f"### Image: `{att.filename}` (analysed by {OLLAMA_VISION_MODEL})\n{description}")
@@ -891,6 +892,7 @@ class GeminiSelfBot(discord.Client):
         
         # Tracking states
         think_enabled = "--think" in user_prompt.lower()
+        show_stats = "--stats" in user_prompt.lower()
         
         # PROACTIVE SEARCH HEURISTIC
         # Force a search if the user asks about something recent or market-related
@@ -908,10 +910,8 @@ class GeminiSelfBot(discord.Client):
             refine_messages = messages + [
                 {"role": "system", "content": "Generate a single, concise, and highly effective web search query to answer the user's latest request. Use only the necessary keywords. Look at the conversation history to understand pronouns or ambiguous terms. Output ONLY the query text."}
             ]
-            refined_query = await ask_ollama(refine_messages, client=self.ollama_http_client)
-            
-            # Clean up refined query
-            refined_query = refined_query.strip().strip('"').strip("'")
+            refine_res = await ask_ollama(refine_messages, client=self.ollama_http_client)
+            refined_query = refine_res.get("content", "").strip().strip('"').strip("'")
             if refined_query and "Error:" not in refined_query:
                 # Log it so we can see the 'thought' process in terminal
                 logger.info(f"Refined Search Query: '{refined_query}'")
@@ -927,6 +927,10 @@ class GeminiSelfBot(discord.Client):
         # curr_phrases is already set above
         executed_tools = set() # Track to avoid infinite loops
         
+        # Tracking session stats
+        session_tokens = 0
+        last_tps = 0.0
+        
         while iteration < max_iterations:
             iteration += 1
             
@@ -936,7 +940,10 @@ class GeminiSelfBot(discord.Client):
             
             try:
                 # 1. Call Ollama
-                response = await ask_ollama(messages, think=think_enabled, client=self.ollama_http_client)
+                ollama_res = await ask_ollama(messages, think=think_enabled, client=self.ollama_http_client)
+                response = ollama_res.get("content", "")
+                session_tokens += ollama_res.get("tokens", 0)
+                last_tps = ollama_res.get("tps", 0.0)
                 
                 if not response or response.strip() == "":
                     logger.error(f"Error in agent loop iteration {iteration}: Empty response from Ollama.")
@@ -959,6 +966,7 @@ class GeminiSelfBot(discord.Client):
                     if SHOW_LOADING_MESSAGES:
                         await loading_msg.edit(content=f"> 🔍 ***{random.choice(curr_phrases)}***")
 
+                    # Note: search_web doesn't return tokens, but we could track its call
                     search_results = await search_web(user_prompt, client=self.ollama_http_client)
                     increment_stats(searches=1)
                     context = "\n".join([f"- {r['title']}: {r['snippet']}" for r in search_results.get('results', [])])
@@ -1017,7 +1025,7 @@ class GeminiSelfBot(discord.Client):
 
                 # 5. Final Response
                 status_task.cancel()
-                await self._send_safe_response(loading_msg, response, message)
+                await self._send_safe_response(loading_msg, response, message, tokens=session_tokens, tps=last_tps, show_stats=show_stats)
                 increment_stats(messages=1)
                 return
 
@@ -1034,12 +1042,29 @@ class GeminiSelfBot(discord.Client):
                     pass
                 return
 
-    async def _send_safe_response(self, loading_msg: discord.Message | None, content: str, original_msg: discord.Message):
+    async def _send_safe_response(self, loading_msg: discord.Message | None, content: str, original_msg: discord.Message, tokens: int = 0, tps: float = 0.0, show_stats: bool = False):
         """Helper to send responses that might exceed Discord's 2000 character limit, prioritizing newline splits.
         
         When loading_msg is None (SHOW_LOADING_MESSAGES=false), sends a fresh reply instead of editing.
         """
         import re
+        from database import get_stats
+
+        # 1. Append Stats Footer if requested
+        if show_stats and tokens > 0:
+            stats = get_stats()
+            total_tokens = stats.get("tokens_used", 0)
+            
+            # Format total (e.g. 1.2k, 1.5M)
+            if total_tokens > 1_000_000:
+                total_str = f"{total_tokens / 1_000_000:.1f}M"
+            elif total_tokens > 1_000:
+                total_str = f"{total_tokens / 1_000:.1f}k"
+            else:
+                total_str = str(total_tokens)
+                
+            footer = f"\n-# `{tps:.1f} t/s · {tokens} tokens · {total_str} total`"
+            content += footer
         
         # Clean up any leaked system tags or headers the LLM might hallucinate
         # Catches: [TOOL_RESULT], [system], ### [REPLIED TO CONTEXT]:, ### [USER PROMPT]:
