@@ -1,6 +1,7 @@
 import re
 from config import DEFAULT_SYSTEM_PROMPT, MAX_REPLY_CONTEXT_LENGTH, SPICY_LYRICS_KNOWLEDGE_FILE, SPICY_LYRICS_EXAMPLES_DIR
 import pathlib
+import base64
 
 def clean_mention(content: str, user_id: int) -> str:
     """
@@ -243,9 +244,13 @@ def build_context(user_prompt: str, reply_context: str | None = None, is_reply_t
         )
     })
 
-    messages.append({
+    user_message = {
         "role": "user",
         "content": final_user_content
-    })
+    }
     
+    if images_data:
+        user_message["images"] = [base64.b64encode(img).decode("utf-8") for img in images_data]
+
+    messages.append(user_message)
     return messages
