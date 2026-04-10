@@ -15,6 +15,12 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 # Image support is now native in the main model.
 
+# Gemini Configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+USE_GEMINI = os.getenv("USE_GEMINI", "true").lower() in ("true", "1", "yes")
+USE_OLLAMA_FALLBACK = os.getenv("USE_OLLAMA_FALLBACK", "true").lower() in ("true", "1", "yes")
+
 # SearXNG Configuration
 SEARXNG_BASE_URL = os.getenv("SEARXNG_BASE_URL", "http://localhost:8888")
 SEARXNG_FORMAT = os.getenv("SEARXNG_FORMAT", "json")

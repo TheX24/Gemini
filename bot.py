@@ -10,7 +10,7 @@ from config import (
 )
 
 from context_builder import clean_mention, build_context
-from ollama_client import ask_ollama
+from llm_client import ask_llm
 from tools import search_web
 from guardrails import is_safe_prompt
 from database import init_db, add_reminder, get_due_reminders, delete_reminder, save_memory, get_memories, increment_stats, get_stats
@@ -47,18 +47,18 @@ BLOCKED_EXTENSIONS: set[str] = {
     ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
     ".iso", ".img", ".dmg",
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".mp3", ".mp4", ".wav", ".flac", ".ogg", ".avi", ".mkv", ".mov",
 }
 
 MAX_ATTACHMENT_BYTES = 50_000  # Bytes per file
 MAX_ATTACHMENT_FILES = 5
 
-# Image attachments — handled via vision model or OCR, not the text pipeline
-ALLOWED_IMAGE_EXTENSIONS: set[str] = {
+# Multimedia attachments — handled natively via Gemini
+ALLOWED_MEDIA_EXTENSIONS: set[str] = {
     ".png", ".jpg", ".jpeg", ".webp", ".gif",
+    ".mp4", ".mp3", ".wav", ".flac", ".ogg", ".avi", ".mkv", ".mov", ".webm", ".heic"
 }
-MAX_IMAGE_BYTES = 10_000_000  # 10 MB per image
-MAX_IMAGE_FILES = 3
+MAX_MEDIA_BYTES = 10_000_000  # 10 MB per file
+MAX_MEDIA_FILES = 3
 
 async def read_text_attachments(attachments: list[discord.Attachment]) -> tuple[str | None, str | None]:
     """
@@ -117,45 +117,61 @@ async def read_text_attachments(attachments: list[discord.Attachment]) -> tuple[
     return combined, None
 
 
-async def read_image_attachments(
+async def read_media_attachments(
     attachments: list[discord.Attachment]
-) -> tuple[list[bytes] | None, str | None]:
+) -> tuple[list[dict] | None, str | None]:
     """
-    Download and validate image attachments from a Discord message.
+    Download and validate media attachments from a Discord message.
 
     Returns:
-        (list_of_image_bytes, error_message) — exactly one will be non-None.
+        (list_of_media_dicts, error_message) — exactly one will be non-None.
+        Each dict has 'mime_type' and 'data' (bytes).
     """
-    image_atts = [
+    import mimetypes
+    
+    media_atts = [
         a for a in attachments
-        if os.path.splitext(a.filename)[1].lower() in ALLOWED_IMAGE_EXTENSIONS
-    ][:MAX_IMAGE_FILES]
+        if os.path.splitext(a.filename)[1].lower() in ALLOWED_MEDIA_EXTENSIONS or getattr(a, "is_voice_message", lambda: False)()
+    ][:MAX_MEDIA_FILES]
 
-    if not image_atts:
+    if not media_atts:
         return None, None
 
-    bytes_list: list[bytes] = []
-    for att in image_atts:
-        if att.size > MAX_IMAGE_BYTES:
+    media_list: list[dict] = []
+    for att in media_atts:
+        if att.size > MAX_MEDIA_BYTES:
             size_mb = att.size / 1_000_000
             return None, (
-                f"❌ **Image too large:** `{att.filename}` is {size_mb:.1f} MB. "
-                f"Maximum per image is {MAX_IMAGE_BYTES // 1_000_000} MB."
+                f"❌ **Media too large:** `{att.filename}` is {size_mb:.1f} MB. "
+                f"Maximum per file is {MAX_MEDIA_BYTES // 1_000_000} MB."
             )
 
-        # Download the raw image bytes
+        # Download the raw bytes
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 resp = await client.get(att.url)
                 resp.raise_for_status()
-                bytes_list.append(resp.content)
+                mime_type, _ = mimetypes.guess_type(att.filename)
+                if getattr(att, "is_voice_message", lambda: False)():
+                    mime_type = "audio/ogg"
+                elif not mime_type:
+                    # fallback
+                    ext = os.path.splitext(att.filename)[1].lower()
+                    if ext == ".mp4": mime_type = "video/mp4"
+                    elif ext == ".mp3": mime_type = "audio/mp3"
+                    elif ext == ".wav": mime_type = "audio/wav"
+                    elif ext == ".ogg": mime_type = "audio/ogg"
+                    elif ext == ".webm": mime_type = "video/webm"
+                    elif ext == ".mov": mime_type = "video/quicktime"
+                    else: mime_type = "image/jpeg"
+                media_list.append({"mime_type": mime_type, "data": resp.content, "filename": att.filename})
         except Exception as e:
             return None, f"❌ **Failed to download** `{att.filename}`: {e}"
 
-    if not bytes_list:
+    if not media_list:
         return None, None
 
-    return bytes_list, None
+    return media_list, None
 
 
 # Set up logging for the bot
@@ -273,7 +289,7 @@ class PromptQueue:
         logger.info("Starting PromptQueue worker...")
         self.worker_task = asyncio.create_task(self._worker())
 
-    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self, history=None, user_info=None, other_users_info=None, attachments_text=None, images_data=None, status_data=None):
+    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self, history=None, user_info=None, other_users_info=None, attachments_text=None, media_data=None, status_data=None):
         if user_id in self.active_user_ids:
             logger.warning(f"User {user_id} already has an active task. Put rejected.")
             return False, 0
@@ -293,7 +309,7 @@ class PromptQueue:
             "user_info": user_info or {},
             "other_users_info": other_users_info,
             "attachments_text": attachments_text,
-            "images_data": images_data,
+            "media_data": media_data,
             "status_data": status_data, # This is a dict/ref: {"task": <asyncio.Task>}
         }
         
@@ -328,7 +344,7 @@ class PromptQueue:
                     task_data["user_info"],
                     task_data.get("other_users_info"),
                     task_data.get("attachments_text"),
-                    task_data.get("images_data"),
+                    task_data.get("media_data"),
                     task_data.get("status_data")
                 )
 
@@ -656,7 +672,6 @@ class GeminiSelfBot(discord.Client):
 
         # Initialize context containers
         attachments_text = None
-        images_data = None
         loading_msg = None
 
         # 1. Identify all attachments (Current Message)
@@ -682,20 +697,21 @@ class GeminiSelfBot(discord.Client):
             if attachments_text:
                 logger.info(f"Loaded {len(text_atts)} text attachment(s)")
 
-        # 4. Handle Image Attachments (Native Direct)
-        image_atts = [a for a in all_attachments if os.path.splitext(a.filename)[1].lower() in ALLOWED_IMAGE_EXTENSIONS]
-        if image_atts:
-            # Run image download (native)
-            images_data, img_err = await read_image_attachments(image_atts)
+        # 4. Handle Media Attachments (Images/Audio/Video Native Direct and Voice Messages)
+        media_atts = [a for a in all_attachments if os.path.splitext(a.filename)[1].lower() in ALLOWED_MEDIA_EXTENSIONS or getattr(a, "is_voice_message", lambda: False)()]
+        media_data = None
+        if media_atts:
+            # Run image/media download (native)
+            media_data, img_err = await read_media_attachments(media_atts)
             if img_err:
-                await message.reply(f"> ❌ **Image Download Failed:** {img_err}")
+                await message.reply(f"> ❌ **Media Download Failed:** {img_err}")
                 return
             
-            logger.info(f"Prepared {len(image_atts)} image(s) for direct multimodal inference")
+            logger.info(f"Prepared {len(media_atts)} media file(s) for direct multimodal inference")
 
         # 5. Early exit if no content to process
         is_reply = message.reference is not None
-        if not user_prompt and not is_reply and not attachments_text and not images_data:
+        if not user_prompt and not is_reply and not attachments_text and not media_data:
             return
 
         # 6. Display final loading state if not already set by image processing
@@ -766,7 +782,7 @@ class GeminiSelfBot(discord.Client):
             user_info=user_info,
             other_users_info=other_users_info,
             attachments_text=attachments_text,
-            images_data=images_data,
+            media_data=media_data,
             status_data=status_data,
         )
 
@@ -791,7 +807,7 @@ class GeminiSelfBot(discord.Client):
         else:
             logger.info(f"on_message: User {message.author.id} added at pos 0 (Immediate Processing)")
 
-    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool, history: list, user_info: dict, other_users_info: list | None = None, attachments_text: str | None = None, images_data: list[bytes] | None = None, status_data: dict | None = None):
+    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool, history: list, user_info: dict, other_users_info: list | None = None, attachments_text: str | None = None, media_data: list[dict] | None = None, status_data: dict | None = None):
         """
         Agentic loop allowing the main model to decide if it needs tools, thinking, or direct answer.
         """
@@ -816,7 +832,7 @@ class GeminiSelfBot(discord.Client):
         # 3. Build final prompt structures
         user_info_for_context = user_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
         other_for_context = other_users_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
-        messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info_for_context, other_users_info=other_for_context, bot_username=str(self.user), images_data=images_data)
+        messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info_for_context, other_users_info=other_for_context, bot_username=str(self.user), media_data=media_data)
 
         # Inject attachment content as a system message so the model can reason over the files
         if attachments_text:
@@ -852,7 +868,7 @@ class GeminiSelfBot(discord.Client):
             refine_messages = messages + [
                 {"role": "system", "content": "Generate a single, concise, and highly effective web search query to answer the user's latest request. Use only the necessary keywords. Look at the conversation history to understand pronouns or ambiguous terms. Output ONLY the query text."}
             ]
-            refine_res = await ask_ollama(refine_messages, client=self.ollama_http_client)
+            refine_res = await ask_llm(refine_messages, client=self.ollama_http_client)
             refined_query = refine_res.get("content", "").strip().strip('"').strip("'")
             if refined_query and "Error:" not in refined_query:
                 # Log it so we can see the 'thought' process in terminal
@@ -881,7 +897,7 @@ class GeminiSelfBot(discord.Client):
             
             try:
                 # 1. Call Ollama
-                ollama_res = await ask_ollama(messages, think=think_enabled, client=self.ollama_http_client)
+                ollama_res = await ask_llm(messages, think=think_enabled, client=self.ollama_http_client)
                 response = ollama_res.get("content", "")
                 session_tokens += ollama_res.get("tokens", 0)
                 last_tps = ollama_res.get("tps", 0.0)
@@ -967,7 +983,17 @@ class GeminiSelfBot(discord.Client):
                 # 5. Final Response
                 await safe_cancel_status(status_task)
                 if status_data: status_data["task"] = None
-                await self._send_safe_response(loading_msg, response, message, tokens=session_tokens, tps=last_tps, show_stats=show_stats)
+                
+                
+                await self._send_safe_response(
+                    loading_msg, 
+                    response, 
+                    message, 
+                    tokens=session_tokens, 
+                    tps=last_tps, 
+                    show_stats=show_stats, 
+                    used_model=ollama_res.get("model", "")
+                )
                 increment_stats(messages=1)
                 return
 
@@ -984,7 +1010,7 @@ class GeminiSelfBot(discord.Client):
                     pass
                 return
 
-    async def _send_safe_response(self, loading_msg: discord.Message | None, content: str, original_msg: discord.Message, tokens: int = 0, tps: float = 0.0, show_stats: bool = False):
+    async def _send_safe_response(self, loading_msg: discord.Message | None, content: str, original_msg: discord.Message, tokens: int = 0, tps: float = 0.0, show_stats: bool = False, used_model: str = ""):
         """Helper to send responses that might exceed Discord's 2000 character limit, prioritizing newline splits.
         
         When loading_msg is None (SHOW_LOADING_MESSAGES=false), sends a fresh reply instead of editing.
@@ -1004,8 +1030,10 @@ class GeminiSelfBot(discord.Client):
                 total_str = f"{total_tokens / 1_000:.1f}k"
             else:
                 total_str = str(total_tokens)
-                
-            footer = f"\n-# `{tps:.1f} t/s · {tokens} tokens · {total_str} total`"
+            if used_model and "gemini" in used_model.lower():
+                footer = f"\n-# `{used_model} · {tokens} tokens · {total_str} total`"
+            else:
+                footer = f"\n-# `{tps:.1f} t/s · {tokens} tokens · {total_str} total`"
             content += footer
         
         # Clean up any leaked system tags or headers the LLM might hallucinate
@@ -1047,22 +1075,36 @@ class GeminiSelfBot(discord.Client):
                 chunks.append(remaining[:split_idx].strip())
                 remaining = remaining[split_idx:].strip()
 
-        if loading_msg is not None:
-            # Edit the pre-existing placeholder into the first chunk
-            if chunks:
-                await loading_msg.edit(content=chunks[0])
-            for i in range(1, len(chunks)):
-                if chunks[i].strip():
-                    await original_msg.channel.send(chunks[i])
+        if not chunks:
+            chunks = [""]
+            
+        discord_files = []
+
+        # Send chunks
+        for i, chunk in enumerate(chunks):
+            # Only attach files to the final chunk
+            files_to_attach = discord_files if i == len(chunks) - 1 else []
+            
+            try:
+                if i == 0:
+                    if loading_msg:
+                        if files_to_attach:
+                            await loading_msg.edit(content=chunk, attachments=files_to_attach)
+                        else:
+                            await loading_msg.edit(content=chunk)
+                    else:
+                        if files_to_attach:
+                            await original_msg.reply(chunk, mention_author=False, files=files_to_attach)
+                        else:
+                            await original_msg.reply(chunk, mention_author=False)
+                else:
+                    if files_to_attach:
+                        await original_msg.channel.send(chunk, files=files_to_attach)
+                    else:
+                        await original_msg.channel.send(chunk)
                     await asyncio.sleep(0.8)
-        else:
-            # No placeholder exists — reply fresh and send continuations
-            if chunks:
-                await original_msg.reply(chunks[0])
-            for i in range(1, len(chunks)):
-                if chunks[i].strip():
-                    await original_msg.channel.send(chunks[i])
-                    await asyncio.sleep(0.8)
+            except Exception as e:
+                logger.error(f"Failed to send/edit message chunk {i}: {e}")
 
     async def _dispatch_tool(self, name: str, args: str, message: discord.Message, loading_msg: discord.Message) -> str:
         """Helper to execute tools and return a string result for the LLM."""

@@ -74,7 +74,8 @@ async def _call_ollama(messages: list, think: bool, client: httpx.AsyncClient, m
         return {
             "content": data.get("message", {}).get("content", ""),
             "tokens": prompt_tokens + eval_tokens,
-            "tps": tps
+            "tps": tps,
+            "model": model
         }
         
     except Exception as e:

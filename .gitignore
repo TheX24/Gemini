@@ -6,3 +6,4 @@ bot_data.db
 prompt.*
 examples/
 spicy_lyrics_knowledge.md
+service_account.json

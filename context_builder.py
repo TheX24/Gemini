@@ -32,10 +32,10 @@ def is_spicy_query(user_prompt: str, history: list | None = None) -> bool:
         
     return any(keyword in text_to_check for keyword in spicy_keywords)
 
-def build_context(user_prompt: str, reply_context: str | None = None, is_reply_to_self: bool = True, history: list | None = None, recap: str | None = None, user_info: dict | None = None, other_users_info: list | None = None, bot_username: str | None = None, images_data: list[bytes] | None = None) -> list:
+def build_context(user_prompt: str, reply_context: str | None = None, is_reply_to_self: bool = True, history: list | None = None, recap: str | None = None, user_info: dict | None = None, other_users_info: list | None = None, bot_username: str | None = None, media_data: list[dict] | None = None) -> list:
     """
     Construct the final list of messages for Ollama with history and optional recap.
-    Includes direct multimodal support for images.
+    Includes direct multimodal support for images, video, and audio.
     """
     import datetime
     import base64
@@ -234,6 +234,10 @@ def build_context(user_prompt: str, reply_context: str | None = None, is_reply_t
 
     final_user_content += f"### [USER PROMPT]:\n{user_prompt}\n### [USER PROMPT END]"
     
+    if media_data:
+        media_names = [item.get("filename", "unknown_file") for item in media_data]
+        final_user_content += f"\n\n### [ATTACHED MEDIA]:\nThe user attached the following media files to this message (provided as inlineData): {', '.join(media_names)}"
+    
 
     # SYSTEM SANDWICH: Reinforce tool execution protocol at the very end of context
     messages.append({
@@ -249,8 +253,13 @@ def build_context(user_prompt: str, reply_context: str | None = None, is_reply_t
         "content": final_user_content
     }
     
-    if images_data:
-        user_message["images"] = [base64.b64encode(img).decode("utf-8") for img in images_data]
+    if media_data:
+        user_message["media"] = [
+            {
+                "mime_type": item["mime_type"], 
+                "data": base64.b64encode(item["data"]).decode("utf-8")
+            } for item in media_data
+        ]
 
     messages.append(user_message)
     return messages
