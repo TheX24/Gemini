@@ -804,7 +804,16 @@ class GeminiSelfBot(discord.Client):
         recap = None
         short_history = history
 
-        # 2. Build final prompt structures
+        # 2. Extract internal bot flags and clean prompt BEFORE building context
+        think_enabled = "--think" in user_prompt.lower()
+        show_stats = "--stats" in user_prompt.lower()
+        force_search_flag = "--search" in user_prompt.lower()
+        
+        for flag in ["--think", "--stats", "--search"]:
+            user_prompt = re.sub(rf"(?i){re.escape(flag)}\b", "", user_prompt)
+        user_prompt = " ".join(user_prompt.split()).strip()
+
+        # 3. Build final prompt structures
         user_info_for_context = user_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
         other_for_context = other_users_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
         messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info_for_context, other_users_info=other_for_context, bot_username=str(self.user), images_data=images_data)
@@ -821,23 +830,12 @@ class GeminiSelfBot(discord.Client):
                 )
             })
         
-        # 3. Fetch Persistent Memories
+        # 4. Fetch Persistent Memories
         mems = get_memories(message.author.id)
         if mems:
             brain = "\n".join([f"- {m['key']}: {m['value']}" for m in mems])
             messages.insert(1, {"role": "system", "content": f"[User Facts & Memory]:\n{brain}"})
         
-        # Tracking states
-        think_enabled = "--think" in user_prompt.lower()
-        show_stats = "--stats" in user_prompt.lower()
-        force_search_flag = "--search" in user_prompt.lower()
-        
-        # Clean user prompt of internal bot flags before sending to LLM
-        # This prevents the LLM from trying to parse the flags itself or hallucinating stats.
-        for flag in ["--think", "--stats", "--search"]:
-            user_prompt = re.sub(rf"(?i){re.escape(flag)}\b", "", user_prompt)
-        user_prompt = " ".join(user_prompt.split()).strip()
-
         # PROACTIVE SEARCH HEURISTIC
         # Force a search if the user asks about something recent or market-related
         search_keywords = ["lately", "recently", "news", "crisis", "prices", "stock", "next", "upcoming"]
@@ -1165,21 +1163,6 @@ class GeminiSelfBot(discord.Client):
                 transcript = "\n".join([f"{m.author.name}: {m.content}" for m in reversed(history)])
                 return f"Transcribed History:\n{transcript}"
                 
-            elif name == "stats":
-                stats = get_stats()
-                dashboard = (
-                    f"> 📊 **Global Bot Statistics**\n"
-                    f"> 💬 **Messages Answered:** `{stats.get('messages_answered', 0)}`\n"
-                    f"> 🔋 **Tokens Consumed:** `{stats.get('tokens_used', 0)}`\n"
-                    f"> 🔍 **Deep Searches Run:** `{stats.get('searches_run', 0)}`\n"
-                    f"> 🧰 **Tools Executed:** `{stats.get('tools_used', 0)}`"
-                )
-                if loading_msg:
-                    await loading_msg.edit(content=dashboard)
-                else:
-                    await message.reply(dashboard)
-                increment_stats(tools=1, messages=1)
-                return "HANDLED_UI"
                 
             elif name == "fetch_url":
                 from tools import fetch_url
