@@ -1,7 +1,7 @@
 import httpx
 import logging
 import base64
-from config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_NUM_CTX, OLLAMA_VISION_MODEL, VISION_NUM_GPU
+from config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_NUM_CTX
 from database import increment_stats
 
 logger = logging.getLogger(__name__)
@@ -87,69 +87,3 @@ async def _call_ollama(messages: list, think: bool, client: httpx.AsyncClient, m
     except Exception as e:
         logger.error(f"Ollama API Error: {str(e)}")
         return {"content": f"Error: An unexpected error occurred while calling Ollama: {str(e)}", "tokens": 0, "tps": 0.0}
-
-async def ask_ollama_vision(image_bytes: bytes, prompt: str, client: httpx.AsyncClient | None = None) -> dict:
-    """
-    Send an image to the configured OLLAMA_VISION_MODEL and return its description.
-    Returns a dict: {"content": str, "tokens": int, "tps": float}
-    """
-    if not OLLAMA_VISION_MODEL:
-        return {"content": "Error: No vision model configured (OLLAMA_VISION_MODEL is empty).", "tokens": 0, "tps": 0.0}
-
-    b64_image = base64.b64encode(image_bytes).decode("utf-8")
-    url = f"{OLLAMA_BASE_URL}/api/chat"
-    payload = {
-        "model": OLLAMA_VISION_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-                "images": [b64_image],
-            }
-        ],
-        "stream": False,
-        "options": {
-            "num_gpu": VISION_NUM_GPU,  # Configurable via VISION_NUM_GPU in .env (0=CPU, -1=GPU)
-        },
-    }
-
-    async def _do_request(c: httpx.AsyncClient) -> dict:
-        try:
-            logger.info(f"Ollama Vision Request: model={OLLAMA_VISION_MODEL}")
-            resp = await c.post(url, json=payload, timeout=120.0)
-            resp.raise_for_status()
-            data = resp.json()
-            
-            prompt_tokens = data.get("prompt_eval_count", 0)
-            eval_tokens = data.get("eval_count", 0)
-            eval_duration_ns = data.get("eval_duration", 0)
-            
-            tps = 0.0
-            if eval_duration_ns > 0:
-                tps = eval_tokens / (eval_duration_ns / 1e9)
-            
-            total_tokens = prompt_tokens + eval_tokens
-            if total_tokens > 0:
-                logger.info(f"[VISION USAGE]: Prompt: {prompt_tokens} tokens | Generation: {eval_tokens} tokens | TPS: {tps:.1f}")
-                increment_stats(tokens=total_tokens)
-
-            content = data.get("message", {}).get("content", "").strip()
-            if not content:
-                return {"content": "Error: Vision model returned an empty response.", "tokens": 0, "tps": 0.0}
-            
-            return {
-                "content": content,
-                "tokens": total_tokens,
-                "tps": tps
-            }
-        except httpx.ConnectError:
-            return {"content": "Error: Could not connect to Ollama for vision request.", "tokens": 0, "tps": 0.0}
-        except Exception as e:
-            logger.error(f"Ollama Vision API Error: {e}")
-            return {"content": f"Error: Vision request failed: {e}", "tokens": 0, "tps": 0.0}
-
-    if client is not None:
-        return await _do_request(client)
-    else:
-        async with httpx.AsyncClient() as new_client:
-            return await _do_request(new_client)

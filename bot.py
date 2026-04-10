@@ -9,9 +9,8 @@ from config import (
     PHRASES_PARSING, PHRASES_QUEUE
 )
 
-
 from context_builder import clean_mention, build_context
-from ollama_client import ask_ollama, ask_ollama_vision
+from ollama_client import ask_ollama
 from tools import search_web
 from guardrails import is_safe_prompt
 from database import init_db, add_reminder, get_due_reminders, delete_reminder, save_memory, get_memories, increment_stats, get_stats
@@ -119,19 +118,14 @@ async def read_text_attachments(attachments: list[discord.Attachment]) -> tuple[
 
 
 async def read_image_attachments(
-    attachments: list[discord.Attachment],
-    ollama_client=None,
-    status_msg: discord.Message | None = None,
-    method: str = "vision"
-) -> tuple[str | None, str | None]:
+    attachments: list[discord.Attachment]
+) -> tuple[list[bytes] | None, str | None]:
     """
-    Process image attachments via Ollama vision model (preferred) or pytesseract OCR fallback.
+    Download and validate image attachments from a Discord message.
 
     Returns:
-        (combined_descriptions, error_message) — exactly one will be non-None.
+        (list_of_image_bytes, error_message) — exactly one will be non-None.
     """
-    from config import OLLAMA_VISION_MODEL, VISION_NUM_GPU
-
     image_atts = [
         a for a in attachments
         if os.path.splitext(a.filename)[1].lower() in ALLOWED_IMAGE_EXTENSIONS
@@ -140,7 +134,7 @@ async def read_image_attachments(
     if not image_atts:
         return None, None
 
-    parts: list[str] = []
+    bytes_list: list[bytes] = []
     for att in image_atts:
         if att.size > MAX_IMAGE_BYTES:
             size_mb = att.size / 1_000_000
@@ -154,66 +148,14 @@ async def read_image_attachments(
             async with httpx.AsyncClient(timeout=20.0) as client:
                 resp = await client.get(att.url)
                 resp.raise_for_status()
-                image_bytes = resp.content
+                bytes_list.append(resp.content)
         except Exception as e:
             return None, f"❌ **Failed to download** `{att.filename}`: {e}"
 
-        if OLLAMA_VISION_MODEL and method == "vision":
-            # --- Primary path: Ollama vision model ---
-            if status_msg and SHOW_LOADING_MESSAGES:
-                gpu_label = "GPU" if VISION_NUM_GPU != 0 else "CPU"
-                await status_msg.edit(content=(
-                    f"> 🧠 ***Running `{OLLAMA_VISION_MODEL}` ({gpu_label}) on `{att.filename}`..."
-                    f" ({image_atts.index(att) + 1}/{len(image_atts)})***"
-                ))
-            vision_prompt = (
-                "Analyse this image thoroughly. "
-                "If it contains text (e.g. a screenshot, document, code, log), transcribe ALL visible text exactly. "
-                "Then describe the image content, layout, and any important details."
-            )
-            res = await ask_ollama_vision(image_bytes, vision_prompt, ollama_client)
-            description = res.get("content", "")
-            if description.startswith("Error:"):
-                return None, f"❌ **Vision model error** for `{att.filename}`: {description}"
-            parts.append(f"### Image: `{att.filename}` (analysed by {OLLAMA_VISION_MODEL})\n{description}")
-        else:
-            # --- Fallback path: pytesseract OCR ---
-            if status_msg and SHOW_LOADING_MESSAGES:
-                await status_msg.edit(content=(
-                    f"> 🔍 ***Running OCR on `{att.filename}`..."
-                    f" ({image_atts.index(att) + 1}/{len(image_atts)})***"
-                ))
-            try:
-                import pytesseract  # type: ignore
-                from PIL import Image  # type: ignore
-                import io
-
-                img = Image.open(io.BytesIO(image_bytes))
-                ocr_lang = os.getenv("OCR_LANGUAGES", "eng")
-                text = pytesseract.image_to_string(img, lang=ocr_lang).strip()
-                if text:
-                    parts.append(
-                        f"### OCR from `{att.filename}`:\n"
-                        f"```\n{text}\n```"
-                    )
-                else:
-                    parts.append(
-                        f"### Image: `{att.filename}`\n"
-                        f"*(OCR found no text. Set `OLLAMA_VISION_MODEL` in `.env` for full image understanding.)*"
-                    )
-            except ImportError:
-                return None, (
-                    "❌ **Image support not configured.** Choose one option:\n"
-                    "**Option A** — Vision model (better): add `OLLAMA_VISION_MODEL=moondream` to `.env` "
-                    "then run `ollama pull moondream`.\n"
-                    "**Option B** — OCR (text only): "
-                    "`pip install pytesseract pillow` and `sudo apt install tesseract-ocr`."
-                )
-
-    if not parts:
+    if not bytes_list:
         return None, None
 
-    return "\n\n".join(parts), None
+    return bytes_list, None
 
 
 # Set up logging for the bot
@@ -331,7 +273,7 @@ class PromptQueue:
         logger.info("Starting PromptQueue worker...")
         self.worker_task = asyncio.create_task(self._worker())
 
-    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self, history=None, user_info=None, other_users_info=None, attachments_text=None, images_text=None, status_data=None):
+    async def put(self, user_id, message, loading_msg, user_prompt, reply_content, is_reply_to_self, history=None, user_info=None, other_users_info=None, attachments_text=None, images_data=None, status_data=None):
         if user_id in self.active_user_ids:
             logger.warning(f"User {user_id} already has an active task. Put rejected.")
             return False, 0
@@ -351,7 +293,7 @@ class PromptQueue:
             "user_info": user_info or {},
             "other_users_info": other_users_info,
             "attachments_text": attachments_text,
-            "images_text": images_text,
+            "images_data": images_data,
             "status_data": status_data, # This is a dict/ref: {"task": <asyncio.Task>}
         }
         
@@ -386,7 +328,7 @@ class PromptQueue:
                     task_data["user_info"],
                     task_data.get("other_users_info"),
                     task_data.get("attachments_text"),
-                    task_data.get("images_text"),
+                    task_data.get("images_data"),
                     task_data.get("status_data")
                 )
 
@@ -714,7 +656,7 @@ class GeminiSelfBot(discord.Client):
 
         # Initialize context containers
         attachments_text = None
-        images_text = None
+        images_data = None
         loading_msg = None
 
         # 1. Identify all attachments (Current Message)
@@ -740,27 +682,20 @@ class GeminiSelfBot(discord.Client):
             if attachments_text:
                 logger.info(f"Loaded {len(text_atts)} text attachment(s)")
 
-        # 4. Handle Image Attachments (Automatic Vision/OCR)
+        # 4. Handle Image Attachments (Native Direct)
         image_atts = [a for a in all_attachments if os.path.splitext(a.filename)[1].lower() in ALLOWED_IMAGE_EXTENSIONS]
         if image_atts:
-            # Create loading message early for image processing feedback
-            if SHOW_LOADING_MESSAGES:
-                loading_msg = await message.reply("> 🖼️ ***Analyzing attached images...***")
-            
-            # Run vision model automatically
-            img_obs, img_err = await read_image_attachments(image_atts, self.ollama_http_client, loading_msg, method="vision")
+            # Run image download (native)
+            images_data, img_err = await read_image_attachments(image_atts)
             if img_err:
-                err_text = f"> ❌ **Image Analysis Failed:** {img_err}"
-                if loading_msg: await loading_msg.edit(content=err_text)
-                else: await message.reply(err_text)
+                await message.reply(f"> ❌ **Image Download Failed:** {img_err}")
                 return
             
-            images_text = f"[Image Analysis Attachment]:\n{img_obs}"
-            logger.info(f"Automatically analyzed {len(image_atts)} image(s)")
+            logger.info(f"Prepared {len(image_atts)} image(s) for direct multimodal inference")
 
         # 5. Early exit if no content to process
         is_reply = message.reference is not None
-        if not user_prompt and not is_reply and not attachments_text and not images_text:
+        if not user_prompt and not is_reply and not attachments_text and not images_data:
             return
 
         # 6. Display final loading state if not already set by image processing
@@ -831,7 +766,7 @@ class GeminiSelfBot(discord.Client):
             user_info=user_info,
             other_users_info=other_users_info,
             attachments_text=attachments_text,
-            images_text=images_text,
+            images_data=images_data,
             status_data=status_data,
         )
 
@@ -856,7 +791,7 @@ class GeminiSelfBot(discord.Client):
         else:
             logger.info(f"on_message: User {message.author.id} added at pos 0 (Immediate Processing)")
 
-    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool, history: list, user_info: dict, other_users_info: list | None = None, attachments_text: str | None = None, images_text: str | None = None, status_data: dict | None = None):
+    async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool, history: list, user_info: dict, other_users_info: list | None = None, attachments_text: str | None = None, images_data: list[bytes] | None = None, status_data: dict | None = None):
         """
         Agentic loop allowing the main model to decide if it needs tools, thinking, or direct answer.
         """
@@ -872,7 +807,7 @@ class GeminiSelfBot(discord.Client):
         # 2. Build final prompt structures
         user_info_for_context = user_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
         other_for_context = other_users_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
-        messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info_for_context, other_users_info=other_for_context, bot_username=str(self.user))
+        messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info_for_context, other_users_info=other_for_context, bot_username=str(self.user), images_data=images_data)
 
         # Inject attachment content as a system message so the model can reason over the files
         if attachments_text:
@@ -883,16 +818,6 @@ class GeminiSelfBot(discord.Client):
                     "The user has shared the following file content. "
                     "Refer to it when answering their question.\n\n"
                     + attachments_text
-                )
-            })
-
-        # Inject image descriptions so the model knows what was in the images
-        if images_text:
-            messages.insert(1, {
-                "role": "system",
-                "content": (
-                    "[Attached Images Metadata]:\n"
-                    + images_text
                 )
             })
         
@@ -942,8 +867,6 @@ class GeminiSelfBot(discord.Client):
         # --- AGENTIC REACT LOOP ---
         iteration = 0
         max_iterations = 4
-        # think_enabled is already set above
-        # curr_phrases is already set above
         executed_tools = set() # Track to avoid infinite loops
         
         # Tracking session stats
@@ -1012,7 +935,7 @@ class GeminiSelfBot(discord.Client):
                 action_match = re.search(r'\[ACTION:\s*(\w+)(?:\s*\((.*?)\))?\]', response)
                 if not action_match:
                     # Fallback if the LLM forgets the [ACTION:] wrapper but explicitly typed the tool name
-                    action_match = re.search(r'(analyze_images)\s*\(\s*[\'\"]?(ocr|vision)[\'\"]?\s*\)', response)
+                    action_match = None
                     
                 if action_match:
                     tool_name = action_match.group(1).lower()
@@ -1267,32 +1190,6 @@ class GeminiSelfBot(discord.Client):
                 if res.get("status") == "success":
                     return f"Page Content (truncated to useful portion):\n{res['content']}"
                 return f"Failed to fetch URL: {res.get('message', 'Unknown Error')}"
-
-            elif name == "analyze_images":
-                method = clean_args.lower()
-                if method not in ["ocr", "vision"]:
-                    method = "vision"
-                    
-                image_atts = [a for a in message.attachments if os.path.splitext(a.filename)[1].lower() in ALLOWED_IMAGE_EXTENSIONS]
-                
-                # Check replied-to message if no attachments on the trigger message
-                if not image_atts and message.reference:
-                    try:
-                        ref_msg = message.reference.cached_message or await message.channel.fetch_message(message.reference.message_id)
-                        if ref_msg and ref_msg.attachments:
-                            image_atts = [a for a in ref_msg.attachments if os.path.splitext(a.filename)[1].lower() in ALLOWED_IMAGE_EXTENSIONS]
-                    except discord.HTTPException:
-                        pass
-                
-                if not image_atts:
-                    return "Error: No images were attached to the message or the message you replied to."
-                if SHOW_LOADING_MESSAGES:
-                    await loading_msg.edit(content=f"> 🖼️ ***Running Image Analysis ({method.upper()})...***")
-                img_obs, img_err = await read_image_attachments(image_atts, self.ollama_http_client, loading_msg, method=method)
-                increment_stats(tools=1)
-                if img_err:
-                    return f"Image Analysis Failed: {img_err}"
-                return img_obs or "No content could be extracted from the images."
                 
             return f"Error: Tool '{name}' not found."
         except Exception as e:

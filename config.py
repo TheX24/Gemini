@@ -13,14 +13,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
-# Optional: set to a vision-capable model to enable image understanding.
-# Examples: "moondream", "llava", "qwen2-vl", "minicpm-v"
-# Leave empty to fall back to pytesseract OCR (requires: pip install pytesseract pillow + sudo apt install tesseract-ocr)
-OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "")
-# Number of GPU layers for the vision model.
-# 0 = fully on CPU/RAM (keeps VRAM free for main model) — recommended for co-existence
-# -1 = fully on GPU (fastest, but evicts main model)
-VISION_NUM_GPU = int(os.getenv("VISION_NUM_GPU", "0"))
+# Image support is now native in the main model.
 
 # SearXNG Configuration
 SEARXNG_BASE_URL = os.getenv("SEARXNG_BASE_URL", "http://localhost:8888")
