@@ -3,17 +3,28 @@ import logging
 import asyncio
 import httpx
 import random
-from config import (
-    OLLAMA_MODEL, PHRASES_DEFAULT, PHRASES_THINK, 
-    PHRASES_SEARCH, PHRASES_HYBRID, PHRASES_ACTION, SHOW_LOADING_MESSAGES,
-    PHRASES_PARSING, PHRASES_QUEUE
-)
+import subprocess
+import config
+# Constants
+PHRASES_DEFAULT = config.PHRASES_DEFAULT
+PHRASES_THINK = config.PHRASES_THINK
+PHRASES_SEARCH = config.PHRASES_SEARCH
+PHRASES_HYBRID = config.PHRASES_HYBRID
+PHRASES_ACTION = config.PHRASES_ACTION
+PHRASES_PARSING = config.PHRASES_PARSING
+PHRASES_QUEUE = config.PHRASES_QUEUE
 
 from context_builder import clean_mention, build_context
 from llm_client import ask_llm
-from tools import search_web
+from gemini_client import get_client
+
 from guardrails import is_safe_prompt
-from database import init_db, add_reminder, get_due_reminders, delete_reminder, save_memory, get_memories, increment_stats, get_stats
+from database import (
+    init_db, add_reminder, get_due_reminders, delete_reminder, save_memory, 
+    get_memories, increment_stats, get_stats, save_channel_variation, 
+    save_channel_activity, save_channel_timer, get_channel_settings, get_all_channel_settings,
+    save_system_state, get_system_state, save_keyword_memory, get_keyword_memories
+)
 import time
 import urllib.parse
 import json
@@ -177,15 +188,20 @@ async def read_media_attachments(
 # Set up logging for the bot
 logger = logging.getLogger(__name__)
 
-async def rotate_status(loading_msg: discord.Message, phrases: list, prefix: str = "> ⏳ ***"):
+async def rotate_status(loading_msg: discord.Message | None, phrases: list, prefix: str = "> ⏳ ***", original_msg: discord.Message = None):
     """
     Background task to rotate loading phrases if generation takes a while.
-    Silently exits when SHOW_LOADING_MESSAGES is disabled.
+    When config.SHOW_LOADING_MESSAGES is disabled, uses typing indicator on original_msg instead.
     """
-    if not SHOW_LOADING_MESSAGES:
+    if not config.SHOW_LOADING_MESSAGES:
         try:
-            while True:
-                await asyncio.sleep(3600)  # Park the task; it will be cancelled externally
+            if original_msg:
+                async with original_msg.channel.typing():
+                    while True:
+                        await asyncio.sleep(3600)
+            else:
+                while True:
+                    await asyncio.sleep(3600)
         except asyncio.CancelledError:
             pass
         return
@@ -242,8 +258,13 @@ async def status_loop(bot: discord.Client):
             msgs = stats['messages_answered']
             tokens = stats['tokens_used']
             
-            # Format nicely, e.g., 25.5k
-            tok_str = f"{tokens/1000:.1f}k" if tokens > 1000 else str(tokens)
+            # Format nicely, e.g., 25.5k, 1.25M
+            if tokens >= 1_000_000:
+                tok_str = f"{tokens/1_000_000:.2f}M"
+            elif tokens >= 1000:
+                tok_str = f"{tokens/1000:.1f}k"
+            else:
+                tok_str = str(tokens)
             
             # Send raw protocol-level Presence update to force-render the icon
             # This bypasses library filtering that strips assets from user accounts
@@ -570,10 +591,37 @@ class GeminiSelfBot(discord.Client):
         await self.change_presence(status=discord.Status.online)
         init_db()
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
+        
+        # Check for pending restart notification
+        restart_channel_id = get_system_state("pending_restart_channel")
+        restart_message_id = get_system_state("pending_restart_message_id")
+        
+        if restart_channel_id:
+            try:
+                save_system_state("pending_restart_channel", None) 
+                save_system_state("pending_restart_message_id", None)
+                
+                channel = self.get_channel(int(restart_channel_id)) or await self.fetch_channel(int(restart_channel_id))
+                if channel:
+                    success = False
+                    if restart_message_id:
+                        try:
+                            msg = await channel.fetch_message(int(restart_message_id))
+                            await msg.edit(content="> ✅ **Restarted and Online.**")
+                            success = True
+                        except:
+                            pass # Fallback to sending new message
+                    
+                    if not success:
+                        await channel.send("> ✅ **Restarted and Online.**")
+            except Exception as e:
+                logger.error(f"Failed to send/edit restart notification: {e}")
+
         logger.info("Self-bot is ready and listening for mentions/replies (Status: Online).")
         self.loop.create_task(status_loop(self))
         if not self.reminder_loop_started:
             self.loop.create_task(self.reminder_loop())
+            self.loop.create_task(self.prompt_inactivity_reset_loop())
             self.reminder_loop_started = True
         self.prompt_queue.start()
 
@@ -613,8 +661,174 @@ class GeminiSelfBot(discord.Client):
                 logger.error(f"Error in reminder_loop: {e}")
             
             await asyncio.sleep(10)
+            
+    async def prompt_inactivity_reset_loop(self):
+        """
+        Background task that checks all channels for inactivity and resets prompts to default.
+        """
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                now = time.time()
+                all_settings = get_all_channel_settings()
+                for settings in all_settings:
+                    channel_id = settings['channel_id']
+                    variation = settings['variation']
+                    last_activity = settings['last_activity']
+                    timeout = settings['timeout']
+                    
+                    # Only reset if timeout is enabled (> 0) and we're not already on default
+                    if timeout > 0 and variation != "default":
+                        if now - last_activity > timeout:
+                            logger.info(f"Resetting channel {channel_id} to default due to inactivity.")
+                            save_channel_variation(channel_id, "default")
+            except Exception as e:
+                logger.error(f"Error in prompt_inactivity_reset_loop: {e}")
+            
+            await asyncio.sleep(60) # Check every minute
 
     async def on_message(self, message: discord.Message):
+        # 0. Admin Commands (Owner Only: tx24)
+        if message.content.startswith(";gem"):
+            if message.author.id == 504541573636161546:
+                parts = message.content.split()
+                sub = parts[1].lower() if len(parts) > 1 else "help"
+                
+                # Helper for toggle commands
+                def get_toggle_val(p):
+                    return "true" if p.lower() in ("on", "true", "yes") else "false"
+                
+                if sub == "restart":
+                    init_msg = await message.reply("> 🔄 **Initiating PM2 restart...**")
+                    save_system_state("pending_restart_channel", str(message.channel.id))
+                    save_system_state("pending_restart_message_id", str(init_msg.id))
+                    subprocess.run(["pm2", "restart", "gemini-bot"])
+                    return
+                    
+                elif sub == "model":
+                    if len(parts) < 3:
+                        await message.reply("> ❌ **Usage:** `;gem model <model_id>`")
+                        return
+                    new_model = parts[2].strip()
+                    
+                    # Active Model Validation
+                    validate_msg = await message.reply(f"> 🔍 **Validating model:** `{new_model}`...")
+                    try:
+                        genai_client = get_client()
+                        await genai_client.aio.models.get(model=new_model)
+                        config.update_config("GEMINI_MODEL", new_model)
+                        await validate_msg.edit(content=f"> ✅ **Model validated and changed to:** `{new_model}`")
+                    except Exception as e:
+                        await validate_msg.edit(content=f"> ❌ **Invalid Model:** `{new_model}` is not accessible or does not exist.\n> *Error: {str(e)[:300]}*")
+                    return
+                    
+                elif sub == "autothink":
+                    if len(parts) < 3:
+                        await message.reply("> ❌ **Usage:** `;gem autothink <on/off>`")
+                        return
+                    val = get_toggle_val(parts[2])
+                    config.update_config("AUTO_THINKING", val)
+                    await message.reply(f"> ✅ **Auto-Thinking set to:** `{val == 'true'}`")
+                    return
+                    
+                elif sub == "vertex":
+                    if len(parts) < 3:
+                        await message.reply("> ❌ **Usage:** `;gem vertex <on/off>`")
+                        return
+                    is_on = parts[2].lower() in ("on", "true", "yes")
+                    config.update_config("USE_VERTEX_AI", "true" if is_on else "false")
+                    await message.reply(f"> ✅ **Vertex AI set to:** `{is_on}`")
+                    return
+                    
+                elif sub == "pause":
+                    config.update_config("IS_PAUSED", "true")
+                    await message.reply("> ⏸️ **Bot Paused.**")
+                    return
+                    
+                elif sub == "resume":
+                    config.update_config("IS_PAUSED", "false")
+                    await message.reply("> ▶️ **Bot Resumed.**")
+                    return
+                    
+                elif sub == "statusmsg" or sub == "loading":
+                    if len(parts) < 3:
+                        await message.reply("> ❌ **Usage:** `;gem statusmsg <on/off>`")
+                        return
+                    val = get_toggle_val(parts[2])
+                    config.update_config("SHOW_LOADING_MESSAGES", val)
+                    await message.reply(f"> ✅ **Status Messages set to:** `{val == 'true'}`")
+                    return
+                    
+                elif sub == "timer":
+                    if len(parts) < 3:
+                        chan_settings = get_channel_settings(message.channel.id)
+                        current_timeout = chan_settings.get('timeout', 3600)
+                        t_str = f"{current_timeout//60}m" if current_timeout > 0 else "Permanent"
+                        await message.reply(f"> ⏰ **Current Reset Timer:** `{t_str}`\n> **Usage:** `;gem timer <minutes|perm>`")
+                        return
+                    
+                    val = parts[2].lower()
+                    if val in ("0", "perm", "permanent"):
+                        new_timeout = 0
+                        await message.reply("> ✅ **Reset Timer set to:** `Permanent` (No auto-reset)")
+                    else:
+                        try:
+                            mins = int(val)
+                            if mins < 1: raise ValueError()
+                            new_timeout = mins * 60
+                            await message.reply(f"> ✅ **Reset Timer set to:** `{mins} minutes` of inactivity.")
+                        except ValueError:
+                            await message.reply("> ❌ **Invalid Input:** Please provide a number of minutes (e.g., `15`) or `perm`.")
+                            return
+                    
+                    save_channel_timer(message.channel.id, new_timeout)
+                    return
+
+                elif sub == "queue":
+                    if len(parts) < 3:
+                        await message.reply(f"> ⏳ **Queue Status:** `{'Enabled' if config.ENABLE_QUEUE else 'Disabled'}`\n> **Usage:** `;gem queue <on/off>`")
+                        return
+                    val = get_toggle_val(parts[2])
+                    config.update_config("ENABLE_QUEUE", val)
+                    await message.reply(f"> ✅ **Queue System set to:** `{val == 'true'}`")
+                    return
+
+                elif sub == "join":
+                    if len(parts) < 3:
+                        await message.reply("> ❌ **Usage:** `;gem join <invite_link_or_code>`")
+                        return
+                    invite_input = parts[2].strip()
+                    try:
+                        # discord.py-self method to accept invites
+                        invite = await self.accept_invite(invite_input)
+                        await message.reply(f"> ✅ **Joined Server:** `{invite.guild.name}` ({invite.guild.id})")
+                    except Exception as e:
+                        logger.error(f"Failed to join server: {e}")
+                        await message.reply(f"> ❌ **Failed to join:** `{str(e)}`")
+                    return
+
+                elif sub == "help":
+                    # Full admin help for the owner
+                    help_text = (
+                        "> 🛠️ **Admin Commands**\n"
+                        "- `;gem status`: Detailed system status.\n"
+                        "- `;gem model <id>`: Switch Gemini model.\n"
+                        "- `;gem timer <mins|perm>`: Set inactivity reset timer.\n"
+                        "- `;gem autothink <on/off>`: Toggle native reasoning.\n"
+                        "- `;gem statusmsg <on/off>`: Toggle loading messages.\n"
+                        "- `;gem vertex <on/off>`: Toggle Vertex AI mode.\n"
+                        "- `;gem queue <on/off>`: Toggle prompt queue.\n"
+                        "- `;gem pause/resume`: Control bot processing.\n"
+                        "- `;gem join <invite>`: Join a Discord server.\n"
+                        "- `;gem restart`: Force PM2 process restart.\n\n"
+                        "> 🎭 **Persona Commands**\n"
+                        "- `;gem prompt <name>`: Switch channel personality.\n"
+                        "- `;gem prompts`: List all variations with descriptions.\n"
+                        "- `;gem help`: Show this list."
+                    )
+                    await message.reply(help_text)
+                    return
+
         # 1. Ignore messages from yourself (to prevent infinite loops)
         if message.author.id == self.user.id:
             return
@@ -652,10 +866,81 @@ class GeminiSelfBot(discord.Client):
             except discord.HTTPException:
                 pass
 
+        # 0.5 Public Persona Commands
+        if message.content.startswith(";gem"):
+            parts = message.content.split()
+            sub = parts[1].lower() if len(parts) > 1 else "help"
+            
+            if sub == "prompts" or (sub == "prompt" and len(parts) < 3):
+                settings = get_channel_settings(message.channel.id)
+                current_var = settings.get('variation', 'default')
+                
+                desc_lines = []
+                for k, v in config.PROMPT_DESCRIPTIONS.items():
+                    active_marker = " 🟢" if k == current_var else ""
+                    desc_lines.append(f"- **{k.capitalize()}**: {v}{active_marker}")
+                
+                final_msg = "> 📜 **Available Prompt Variations**\n\n" + "\n".join(desc_lines) + "\n\n> **Usage:** `;gem prompt <name>`"
+                
+                if len(final_msg) > 1950:
+                    parts_msg = [final_msg[i:i+1900] for i in range(0, len(final_msg), 1900)]
+                    for p in parts_msg: await message.reply(p)
+                else: await message.reply(final_msg)
+                return
+
+            elif sub == "prompt":
+                target = parts[2].lower()
+                if target in config.PROMPT_MODIFIERS:
+                    save_channel_variation(message.channel.id, target)
+                    await message.reply(f"> ✅ **Personality shifted to:** `{target.capitalize()}`")
+                else:
+                    await message.reply(f"> ❌ **Unknown variation:** `{target}`. Use `;gem prompts` to see the list.")
+                return
+
+            elif sub == "help" and message.author.id != 504541573636161546:
+                # Public restricted help
+                help_text = (
+                    "> 🎭 **Gemini Persona Commands**\n"
+                    "- `;gem prompt <name>`: Switch the bot's personality for this channel.\n"
+                    "- `;gem prompts`: List all available personalities.\n"
+                    "- `;gem status`: Show current personality and system status.\n"
+                    "- `;gem help`: Show this message."
+                )
+                await message.reply(help_text)
+                return
+
+            elif sub == "status":
+                mode = "Vertex AI" if config.USE_VERTEX_AI else "AI Studio"
+                paused_status = "⏸️ PAUSED" if config.IS_PAUSED else "▶️ RUNNING"
+                think_status = "🧠 ON" if config.AUTO_THINKING else "⚪ OFF"
+                queue_status = "⏳ ON" if config.ENABLE_QUEUE else "⚪ OFF"
+                
+                # Fetch channel-specific settings
+                chan_settings = get_channel_settings(message.channel.id)
+                variation = chan_settings.get('variation', 'default').capitalize()
+                
+                await message.reply(
+                    f"> 📊 **System Status**\n"
+                    f"- **Model:** `{config.GEMINI_MODEL}`\n"
+                    f"- **Variation:** `{variation}`\n"
+                    f"- **Mode:** `{mode}`\n"
+                    f"- **Thinking:** `{think_status}`\n"
+                    f"- **Queue:** `{queue_status}`\n"
+                    f"- **State:** `{paused_status}`"
+                )
+                return
+
         if not (is_mentioned or is_reply_to_self):
             return
+            
+        # Update last activity for the channel consistently on any trigger
+        save_channel_activity(message.channel.id, time.time())
 
-        # 4. Process the message
+        # 4. Check for Pause State (Owner Exception)
+        if config.IS_PAUSED and message.author.id != 504541573636161546:
+            return # Silent ignore when paused
+
+        # 5. Process the message
         logger.info(f"Triggered by {message.author}: '{message.content}'")
         
         # Clean the input
@@ -716,12 +1001,14 @@ class GeminiSelfBot(discord.Client):
 
         # 6. Display final loading state if not already set by image processing
         status_task = None
-        if loading_msg is None and SHOW_LOADING_MESSAGES:
+        if loading_msg is None and config.SHOW_LOADING_MESSAGES:
             loading_msg = await message.reply(f"> ⏳ ***{random.choice(PHRASES_PARSING)}***")
-            status_task = asyncio.create_task(rotate_status(loading_msg, PHRASES_PARSING))
-        elif loading_msg and SHOW_LOADING_MESSAGES:
+            status_task = asyncio.create_task(rotate_status(loading_msg, PHRASES_PARSING, original_msg=message))
+        elif loading_msg and config.SHOW_LOADING_MESSAGES:
             # If image analysis was already running, start rotating parsing phrases
-            status_task = asyncio.create_task(rotate_status(loading_msg, PHRASES_PARSING))
+            status_task = asyncio.create_task(rotate_status(loading_msg, PHRASES_PARSING, original_msg=message))
+        elif not config.SHOW_LOADING_MESSAGES:
+            status_task = asyncio.create_task(rotate_status(None, [], original_msg=message))
 
         status_data = {"task": status_task}
 
@@ -743,69 +1030,108 @@ class GeminiSelfBot(discord.Client):
 
         # Extract extra context if users mention others or refer to them by name
         if len(other_users_info) < 3:
+            # 1. Direct Mentions
             for m in message.mentions:
                 if m.id != self.user.id and m.id != message.author.id and m.id not in relevant_users_scanned:
-                    other_users_info.append(await extract_user_metadata(m, message.guild))
-                    relevant_users_scanned.add(m.id)
-                    if len(other_users_info) >= 3:
-                        break
-
-        prompt_lower = user_prompt.lower()
-        if len(prompt_lower) > 3 and len(other_users_info) < 3:
-            for u_id, u in recent_users_map.items():
-                if u_id in relevant_users_scanned:
-                    continue
-                names_to_check = [u.name, getattr(u, "global_name", None), getattr(u, "display_name", None)]
-                matched = False
-                for n in names_to_check:
-                    if n and len(n) > 2 and (n.lower() in prompt_lower):
-                        matched = True
-                        break
-                if matched:
-                    other_users_info.append(await extract_user_metadata(u, message.guild))
-                    relevant_users_scanned.add(u_id)
-                    if len(other_users_info) >= 3:
-                        break
+                    try:
+                        other_users_info.append(await extract_user_metadata(m, message.guild))
+                        relevant_users_scanned.add(m.id)
+                    except: pass
+                    if len(other_users_info) >= 3: break
+            
+            # 2. Aggressive Name Matching (Recent Users & Guild Members)
+            prompt_lower = user_prompt.lower()
+            if len(prompt_lower) > 2 and len(other_users_info) < 3:
+                # Combine recent users and guild members for a wider search
+                search_pool = list(recent_users_map.values())
+                if message.guild:
+                    # Only add a few extra guild members to avoid massive loops, 
+                    # prioritizing those with distinctive names mentioned
+                    search_pool.extend([m for m in message.guild.members if m.id not in recent_users_map])
+                
+                for u in search_pool:
+                    if u.id == self.user.id or u.id == message.author.id or u.id in relevant_users_scanned:
+                        continue
+                        
+                    # Safely handle attributes that might be None
+                    names = [
+                        (u.name or "").lower(), 
+                        (getattr(u, 'display_name', '') or "").lower(), 
+                        (getattr(u, 'global_name', '') or "").lower()
+                    ]
+                    # Check for whole word match to avoid false positives (e.g. "hi" matching "Hillary")
+                    matched = False
+                    for n in names:
+                        if n and len(n) > 2:
+                            # Use regex for word boundary matching
+                            if re.search(rf'\b{re.escape(n)}\b', prompt_lower):
+                                matched = True
+                                break
+                    
+                    if matched:
+                        other_users_info.append(await extract_user_metadata(u, message.guild))
+                        relevant_users_scanned.add(u.id)
+                        if len(other_users_info) >= 3:
+                            break
 
         # 6. Extract User Metadata (Identity awareness)
         user_info = await extract_user_metadata(message.author, message.guild)
 
-        # 7. Add to queue
-        success, position = await self.prompt_queue.put(
-            message.author.id,
-            message,
-            loading_msg,
-            user_prompt,
-            reply_content,
-            is_reply_to_self,
-            history=history,
-            user_info=user_info,
-            other_users_info=other_users_info,
-            attachments_text=attachments_text,
-            media_data=media_data,
-            status_data=status_data,
-        )
+        # 7. Add to queue (or process immediately if disabled)
+        if config.ENABLE_QUEUE:
+            success, position = await self.prompt_queue.put(
+                message.author.id,
+                message,
+                loading_msg,
+                user_prompt,
+                reply_content,
+                is_reply_to_self,
+                history=history,
+                user_info=user_info,
+                other_users_info=other_users_info,
+                attachments_text=attachments_text,
+                media_data=media_data,
+                status_data=status_data,
+            )
 
+            if not success:
+                err_text = "> ❌ **Queue Full:** You already have an active prompt being processed or in the queue."
+                if loading_msg:
+                    await loading_msg.edit(content=err_text)
+                else:
+                    await message.reply(err_text)
+                return
 
-        if not success:
-            err_text = "> ❌ **Queue Full:** You already have an active prompt being processed or in the queue."
-            if loading_msg:
-                await loading_msg.edit(content=err_text)
+            if position > 0 and loading_msg:
+                await safe_cancel_status(status_data["task"])
+                await loading_msg.edit(content=f"> ⏳ ***Queued (Position #{position})...***")
+                # Update the task in the container so the worker picks up the QUEUE rotation
+                status_data["task"] = asyncio.create_task(rotate_status(loading_msg, PHRASES_QUEUE, prefix=f"> ⏳ ***Queued (Pos #{position}) | ", original_msg=message))
+                
+                logger.info(f"on_message: User {message.author.id} queued at pos {position}")
+            elif position > 0 and not config.SHOW_LOADING_MESSAGES:
+                await safe_cancel_status(status_data["task"])
+                status_data["task"] = asyncio.create_task(rotate_status(None, [], original_msg=message))
+                
+                logger.info(f"on_message: User {message.author.id} queued at pos {position} (Silent Mode)")
             else:
-                await message.reply(err_text)
-            return
-
-        if position > 0 and loading_msg:
-            await safe_cancel_status(status_data["task"])
-            await loading_msg.edit(content=f"> ⏳ ***Queued (Position #{position})...***")
-            # Update the task in the container so the worker picks up the QUEUE rotation
-            status_data["task"] = asyncio.create_task(rotate_status(loading_msg, PHRASES_QUEUE, prefix=f"> ⏳ ***Queued (Pos #{position}) | "))
-            
-            logger.info(f"on_message: User {message.author.id} queued at pos {position}")
-
-            logger.info(f"on_message: User {message.author.id} queued at pos {position}")
+                logger.info(f"on_message: User {message.author.id} added at pos 0 (Immediate Processing)")
         else:
-            logger.info(f"on_message: User {message.author.id} added at pos 0 (Immediate Processing)")
+            # Queue is disabled - process immediately
+            logger.info(f"on_message: Queue disabled. Processing User {message.author.id} immediately.")
+            await self.process_queued_prompt(
+                message,
+                loading_msg,
+                user_prompt,
+                reply_content,
+                is_reply_to_self,
+                history,
+                user_info,
+                other_users_info=other_users_info,
+                attachments_text=attachments_text,
+                media_data=media_data,
+                status_data=status_data
+            )
 
     async def process_queued_prompt(self, message: discord.Message, loading_msg: discord.Message, user_prompt: str, reply_content: str, is_reply_to_self: bool, history: list, user_info: dict, other_users_info: list | None = None, attachments_text: str | None = None, media_data: list[dict] | None = None, status_data: dict | None = None):
         """
@@ -821,18 +1147,22 @@ class GeminiSelfBot(discord.Client):
         short_history = history
 
         # 2. Extract internal bot flags and clean prompt BEFORE building context
-        think_enabled = "--think" in user_prompt.lower()
         show_stats = "--stats" in user_prompt.lower()
         force_search_flag = "--search" in user_prompt.lower()
         
-        for flag in ["--think", "--stats", "--search"]:
+        for flag in ["--stats", "--search"]:
             user_prompt = re.sub(rf"(?i){re.escape(flag)}\b", "", user_prompt)
         user_prompt = " ".join(user_prompt.split()).strip()
 
         # 3. Build final prompt structures
         user_info_for_context = user_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
         other_for_context = other_users_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
-        messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info_for_context, other_users_info=other_for_context, bot_username=str(self.user), media_data=media_data)
+        
+        # Fetch current channel personality
+        settings = get_channel_settings(message.channel.id)
+        variation = settings.get('variation', 'default')
+        
+        messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info_for_context, other_users_info=other_for_context, bot_username=str(self.user), media_data=media_data, variation=variation)
 
         # Inject attachment content as a system message so the model can reason over the files
         if attachments_text:
@@ -846,102 +1176,88 @@ class GeminiSelfBot(discord.Client):
                 )
             })
         
-        # 4. Fetch Persistent Memories
-        mems = get_memories(message.author.id)
-        if mems:
-            brain = "\n".join([f"- {m['key']}: {m['value']}" for m in mems])
-            messages.insert(1, {"role": "system", "content": f"[User Facts & Memory]:\n{brain}"})
+        # 4. Fetch Persistent Memories (Author and Other Relevant Users)
+        mems_to_fetch = [(message.author.id, "You")]
+        if other_users_info:
+            for extra in other_users_info:
+                mems_to_fetch.append((extra.get('id'), extra.get('display_name') or extra.get('username')))
         
-        # PROACTIVE SEARCH HEURISTIC
-        # Force a search if the user asks about something recent or market-related
-        search_keywords = ["lately", "recently", "news", "crisis", "prices", "stock", "next", "upcoming"]
-        is_market_query = any(k in user_prompt.lower() for k in search_keywords)
-        force_search = is_market_query or force_search_flag
+        # We process manually to ensure clear labeling
+        for u_id, name in mems_to_fetch:
+            if not u_id: continue
+            user_mems = get_memories(u_id)
+            if user_mems:
+                brain = "\n".join([f"- {m['key']}: {m['value']}" for m in user_mems])
+                label = f"[User Facts & Memory - {name} (ID: {u_id})]:"
+                messages.insert(1, {"role": "system", "content": f"{label}\n{brain}"})
+
+        # 5. Fetch Global Keyword Memories
+        all_keywords = get_keyword_memories()
+        if all_keywords:
+            matched_keywords = []
+            prompt_low = user_prompt.lower()
+            for kw_obj in all_keywords:
+                kw = kw_obj['keyword']
+                if re.search(rf'\b{re.escape(kw)}\b', prompt_low):
+                    matched_keywords.append(f"- {kw.capitalize()}: {kw_obj['value']}")
+            
+            if matched_keywords:
+                kw_block = "\n".join(matched_keywords)
+                messages.insert(1, {"role": "system", "content": f"[Keyword Facts & Information]:\n{kw_block}"})
         
         curr_phrases = PHRASES_DEFAULT
-        # Use inherited status_task if provided
-        # Step A: Proactive Search (if triggered by keywords)
-        if force_search:
-            logger.info(f"Force Search triggered. Refining query for: '{user_prompt}'")
-            
-            # Use a fast pass to reword based on context (history/recap)
-            refine_messages = messages + [
-                {"role": "system", "content": "Generate a single, concise, and highly effective web search query to answer the user's latest request. Use only the necessary keywords. Look at the conversation history to understand pronouns or ambiguous terms. Output ONLY the query text."}
-            ]
-            refine_res = await ask_llm(refine_messages, client=self.ollama_http_client)
-            refined_query = refine_res.get("content", "").strip().strip('"').strip("'")
-            if refined_query and "Error:" not in refined_query:
-                # Log it so we can see the 'thought' process in terminal
-                logger.info(f"Refined Search Query: '{refined_query}'")
-                search_results = await search_web(refined_query)
-                messages.append({"role": "system", "content": f"[TOOL_RESULT (Proactive Search)]: {search_results}"})
-            else:
-                logger.warning("Query refinement failed or returned empty results.")
-
         # --- AGENTIC REACT LOOP ---
         iteration = 0
-        max_iterations = 4
+        max_iterations = 8
         executed_tools = set() # Track to avoid infinite loops
         
         # Tracking session stats
         session_tokens = 0
         last_tps = 0.0
+        accumulated_thought = ""
+        think_enabled = config.AUTO_THINKING  # starts True if native thinking is on
         
         while iteration < max_iterations:
             iteration += 1
             
             # Start/Restart rotation if needed
             await safe_cancel_status(status_task)
-            status_task = asyncio.create_task(rotate_status(loading_msg, curr_phrases))
+            status_task = asyncio.create_task(rotate_status(loading_msg, curr_phrases, original_msg=message))
             if status_data: status_data["task"] = status_task
             
             try:
-                # 1. Call Ollama
-                ollama_res = await ask_llm(messages, think=think_enabled, client=self.ollama_http_client)
-                response = ollama_res.get("content", "")
-                session_tokens += ollama_res.get("tokens", 0)
-                last_tps = ollama_res.get("tps", 0.0)
+                # 1. Call LLM
+                llm_res = await ask_llm(messages, client=self.ollama_http_client)
+                response = llm_res.get("content", "")
+                session_tokens += llm_res.get("tokens", 0)
+                last_tps = llm_res.get("tps", 0.0)
+                
+                # Capture native reasoning parts
+                if llm_res.get("thought"):
+                    accumulated_thought += llm_res["thought"] + "\n"
                 
                 if not response or response.strip() == "":
-                    logger.error(f"Error in agent loop iteration {iteration}: Empty response from Ollama.")
-                    # Fallback for Thinking Mode
+                    logger.error(f"Error in agent loop iteration {iteration}: Empty response.")
                     if think_enabled:
                         response = "I have finished my reasoning process. How can I help you further?"
                     else:
                         break
+
+                # Detect LLM error strings and suppress them (don't send to Discord)
+                if response.startswith("Error communicating") or response.startswith("Error:"):
+                    logger.warning(f"LLM returned error string on iteration {iteration}, suppressing: {response[:100]}")
+                    break
                 
-                if response.startswith("Error: "):
-                    logger.error(f"Ollama Error in loop: {response}")
-                    await loading_msg.edit(content=f"⚠️ **Ollama Error:** {response}")
-                    await safe_cancel_status(status_task)
-                    return
 
-                # 2. Forced Search (Iteration 1 only)
-                if iteration == 1 and force_search:
-                    logger.info("Force Search triggered by flag.")
-                    curr_phrases = PHRASES_HYBRID if think_enabled else PHRASES_SEARCH
-                    if SHOW_LOADING_MESSAGES:
-                        await loading_msg.edit(content=f"> 🔍 ***{random.choice(curr_phrases)}***")
-
-                    # Note: search_web doesn't return tokens, but we could track its call
-                    search_results = await search_web(user_prompt, client=self.ollama_http_client)
-                    increment_stats(searches=1)
-                    context = "\n".join([f"- {r['title']}: {r['snippet']}" for r in search_results.get('results', [])])
-                    messages.append({"role": "system", "content": f"[Web Search Results]:\n{context}"})
-                    force_search = False
-                    continue
-
-                # 3. Mode Switch: [MODE: think]
-                if "[MODE: think]" in response and not think_enabled:
-                    logger.info("Model requested Thinking Mode.")
+                # 3. Legacy Mode Switch: [MODE: think] — only active when AUTO_THINKING is OFF
+                if not config.AUTO_THINKING and "[MODE: think]" in response and not think_enabled:
+                    logger.info("Model requested Legacy Thinking Mode.")
                     think_enabled = True
-                    # If we were searching, move to Hybrid. Otherwise move to Think.
                     curr_phrases = PHRASES_HYBRID if curr_phrases in (PHRASES_SEARCH, PHRASES_ACTION) else PHRASES_THINK
 
                     clean_resp = response.replace("[MODE: think]", "").strip()
                     if clean_resp:
                         messages.append({"role": "assistant", "content": clean_resp})
-                    # Use a directive to guide the model
                     messages.append({"role": "system", "content": "[DIRECTIVE]: You are now in Thinking Mode. Provide a detailed, step-by-step reasoning chain before your final answer."})
                     continue
 
@@ -963,11 +1279,8 @@ class GeminiSelfBot(discord.Client):
                     logger.info(f"Model triggered tool: {tool_name}({tool_args})")
                     executed_tools.add(tool_id)
                     
-                    # Update phrases for the next iteration (rotation will pick it up)
-                    if tool_name == "search_web" or tool_name == "search":
-                        curr_phrases = PHRASES_HYBRID if think_enabled else PHRASES_SEARCH
-                    else:
-                        curr_phrases = PHRASES_HYBRID if think_enabled else PHRASES_ACTION
+                    # Update phrases for the next iteration
+                    curr_phrases = PHRASES_HYBRID if config.AUTO_THINKING else PHRASES_ACTION
 
                     tool_result = await self._dispatch_tool(tool_name, tool_args, message, loading_msg)
                     
@@ -980,11 +1293,11 @@ class GeminiSelfBot(discord.Client):
                     continue
 
 
-                # 5. Final Response
+                # 5. Final Response formatting
                 await safe_cancel_status(status_task)
                 if status_data: status_data["task"] = None
                 
-                
+                # Note: accumulated_thought is kept internally for quality but not displayed per user preference
                 await self._send_safe_response(
                     loading_msg, 
                     response, 
@@ -992,7 +1305,7 @@ class GeminiSelfBot(discord.Client):
                     tokens=session_tokens, 
                     tps=last_tps, 
                     show_stats=show_stats, 
-                    used_model=ollama_res.get("model", "")
+                    used_model=llm_res.get("model", "")
                 )
                 increment_stats(messages=1)
                 return
@@ -1113,7 +1426,7 @@ class GeminiSelfBot(discord.Client):
             clean_args = args.strip(' "\'')
             
             if name == "search":
-                if SHOW_LOADING_MESSAGES:
+                if config.SHOW_LOADING_MESSAGES:
                     await loading_msg.edit(content=f"> 🔍 ***{random.choice(PHRASES_SEARCH)}***")
                 res = await search_web(clean_args, client=self.ollama_http_client)
                 increment_stats(searches=1)
@@ -1186,12 +1499,37 @@ class GeminiSelfBot(discord.Client):
 
                 
             elif name == "memory_save":
-                # Expecting format: "key", "value"
-                parts = [p.strip(' "') for p in clean_args.split(",")]
-                key = parts[0] if parts[0] else "note"
-                val = parts[1] if len(parts) > 1 else ""
-                save_memory(message.author.id, key, val)
-                reply_text = "> 🧠 **Memory Saved:** I've taken a note of that."
+                # Expecting format: target, "key", "value" (target can be id or keyword)
+                parts = [p.strip(' "\'') for p in clean_args.split(",")]
+                
+                # Check if the first part is a potential ID (numeric) or a keyword
+                if len(parts) >= 2:
+                    first_arg = parts[0]
+                    if first_arg.isdigit():
+                        # Target is a User ID
+                        target_id = int(first_arg)
+                        key = parts[1] if parts[1] else "note"
+                        val = parts[2] if len(parts) > 2 else ""
+                        save_memory(target_id, key, val)
+                        
+                        target_name = "you"
+                        if target_id != message.author.id:
+                            member = message.guild.get_member(target_id) if message.guild else None
+                            target_name = member.display_name if member else f"User {target_id}"
+                        reply_text = f"> 🧠 **Memory Saved:** I've taken a note about {target_name}."
+                    else:
+                        # Target is a Keyword
+                        keyword = first_arg
+                        val = parts[1] if parts[1] else ""
+                        # If a third arg exists, join it to value or treat parts[1] as key?
+                        # For keywords, the tool description says memory_save("keyword", "value")
+                        save_keyword_memory(keyword, val)
+                        reply_text = f"> 🧠 **Keyword Saved:** I'll remember that when '{keyword}' is mentioned."
+                else:
+                    # Fallback to simple note for author
+                    save_memory(message.author.id, "note", parts[0] if parts else "")
+                    reply_text = f"> 🧠 **Memory Saved:** I've taken a note for you."
+
                 if loading_msg:
                     await loading_msg.edit(content=reply_text)
                 else:
@@ -1208,7 +1546,7 @@ class GeminiSelfBot(discord.Client):
                 
             elif name == "fetch_url":
                 from tools import fetch_url
-                if SHOW_LOADING_MESSAGES:
+                if config.SHOW_LOADING_MESSAGES:
                     await loading_msg.edit(content=f"> 🌐 ***Fetching URL content...***")
                 res = await fetch_url(clean_args, client=self.ollama_http_client)
                 increment_stats(tools=1)

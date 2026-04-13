@@ -1,5 +1,6 @@
 import re
-from config import DEFAULT_SYSTEM_PROMPT, MAX_REPLY_CONTEXT_LENGTH, SPICY_LYRICS_KNOWLEDGE_FILE, SPICY_LYRICS_EXAMPLES_DIR
+import config
+from config import MAX_REPLY_CONTEXT_LENGTH, SPICY_LYRICS_KNOWLEDGE_FILE, SPICY_LYRICS_EXAMPLES_DIR
 import pathlib
 import base64
 
@@ -32,7 +33,7 @@ def is_spicy_query(user_prompt: str, history: list | None = None) -> bool:
         
     return any(keyword in text_to_check for keyword in spicy_keywords)
 
-def build_context(user_prompt: str, reply_context: str | None = None, is_reply_to_self: bool = True, history: list | None = None, recap: str | None = None, user_info: dict | None = None, other_users_info: list | None = None, bot_username: str | None = None, media_data: list[dict] | None = None) -> list:
+def build_context(user_prompt: str, reply_context: str | None = None, is_reply_to_self: bool = True, history: list | None = None, recap: str | None = None, user_info: dict | None = None, other_users_info: list | None = None, bot_username: str | None = None, media_data: list[dict] | None = None, variation: str = "default") -> list:
     """
     Construct the final list of messages for Ollama with history and optional recap.
     Includes direct multimodal support for images, video, and audio.
@@ -42,7 +43,7 @@ def build_context(user_prompt: str, reply_context: str | None = None, is_reply_t
     now_str = datetime.datetime.now().strftime("%A, %B %d, %Y, %H:%M:%S")
     
     messages = [
-        {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+        {"role": "system", "content": config.get_system_prompt(variation)},
     ]
 
 

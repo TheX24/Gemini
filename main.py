@@ -2,9 +2,8 @@ import asyncio
 import logging
 import httpx
 import signal
-from config import DISCORD_TOKEN, SEARXNG_BASE_URL
+from config import DISCORD_TOKEN
 from bot import GeminiSelfBot
-from searxng_manager import SearxngManager
 
 # Configure logging
 log_format = '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
@@ -24,15 +23,10 @@ logging.basicConfig(
 # Silence noisy libraries on the terminal (but they remain in the log file)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("discord").setLevel(logging.WARNING)
-logging.getLogger("searxng_manager").setLevel(logging.WARNING)
 
 logger = logging.getLogger("main")
 
 async def main():
-    # 0. Start SearXNG Manager
-    searxng = SearxngManager(SEARXNG_BASE_URL)
-    await searxng.start()
-
     # 1. Initialize the shared AsyncClient for Ollama
     async with httpx.AsyncClient() as ollama_client:
         
@@ -50,7 +44,6 @@ async def main():
         finally:
             if not bot.is_closed():
                 await bot.close()
-            searxng.stop()
             logger.info("Bot shutdown complete.")
 
 if __name__ == "__main__":

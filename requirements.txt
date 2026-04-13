@@ -1,4 +1,4 @@
 discord.py-self
 httpx
 python-dotenv
-google-auth
+google-genai
