@@ -21,8 +21,8 @@ from gemini_client import get_client
 from guardrails import is_safe_prompt
 from database import (
     init_db, add_reminder, get_due_reminders, delete_reminder, save_memory, 
-    get_memories, increment_stats, get_stats, save_channel_variation, 
-    save_channel_activity, save_channel_timer, get_channel_settings, get_all_channel_settings,
+    get_memories, increment_stats, get_stats, save_user_variation, 
+    get_user_settings, get_message_variation, save_message_variation,
     save_system_state, get_system_state, save_keyword_memory, get_keyword_memories
 )
 import time
@@ -621,7 +621,6 @@ class GeminiSelfBot(discord.Client):
         self.loop.create_task(status_loop(self))
         if not self.reminder_loop_started:
             self.loop.create_task(self.reminder_loop())
-            self.loop.create_task(self.prompt_inactivity_reset_loop())
             self.reminder_loop_started = True
         self.prompt_queue.start()
 
@@ -662,35 +661,13 @@ class GeminiSelfBot(discord.Client):
             
             await asyncio.sleep(10)
             
-    async def prompt_inactivity_reset_loop(self):
-        """
-        Background task that checks all channels for inactivity and resets prompts to default.
-        """
-        await self.wait_until_ready()
-        while not self.is_closed():
-            try:
-                now = time.time()
-                all_settings = get_all_channel_settings()
-                for settings in all_settings:
-                    channel_id = settings['channel_id']
-                    variation = settings['variation']
-                    last_activity = settings['last_activity']
-                    timeout = settings['timeout']
-                    
-                    # Only reset if timeout is enabled (> 0) and we're not already on default
-                    if timeout > 0 and variation != "default":
-                        if now - last_activity > timeout:
-                            logger.info(f"Resetting channel {channel_id} to default due to inactivity.")
-                            save_channel_variation(channel_id, "default")
-            except Exception as e:
-                logger.error(f"Error in prompt_inactivity_reset_loop: {e}")
-            
-            await asyncio.sleep(60) # Check every minute
-
     async def on_message(self, message: discord.Message):
         # 0. Admin Commands (Owner Only: tx24)
         if message.content.startswith(";gem"):
-            if message.author.id == 504541573636161546:
+            is_owner = message.author.id == 504541573636161546
+            is_self_admin = (message.author.id == self.user.id and message.guild and message.guild.id == 1490733173246660658)
+            
+            if is_owner or is_self_admin:
                 parts = message.content.split()
                 sub = parts[1].lower() if len(parts) > 1 else "help"
                 
@@ -759,30 +736,7 @@ class GeminiSelfBot(discord.Client):
                     await message.reply(f"> ✅ **Status Messages set to:** `{val == 'true'}`")
                     return
                     
-                elif sub == "timer":
-                    if len(parts) < 3:
-                        chan_settings = get_channel_settings(message.channel.id)
-                        current_timeout = chan_settings.get('timeout', 3600)
-                        t_str = f"{current_timeout//60}m" if current_timeout > 0 else "Permanent"
-                        await message.reply(f"> ⏰ **Current Reset Timer:** `{t_str}`\n> **Usage:** `;gem timer <minutes|perm>`")
-                        return
-                    
-                    val = parts[2].lower()
-                    if val in ("0", "perm", "permanent"):
-                        new_timeout = 0
-                        await message.reply("> ✅ **Reset Timer set to:** `Permanent` (No auto-reset)")
-                    else:
-                        try:
-                            mins = int(val)
-                            if mins < 1: raise ValueError()
-                            new_timeout = mins * 60
-                            await message.reply(f"> ✅ **Reset Timer set to:** `{mins} minutes` of inactivity.")
-                        except ValueError:
-                            await message.reply("> ❌ **Invalid Input:** Please provide a number of minutes (e.g., `15`) or `perm`.")
-                            return
-                    
-                    save_channel_timer(message.channel.id, new_timeout)
-                    return
+
 
                 elif sub == "queue":
                     if len(parts) < 3:
@@ -811,9 +765,7 @@ class GeminiSelfBot(discord.Client):
                     # Full admin help for the owner
                     help_text = (
                         "> 🛠️ **Admin Commands**\n"
-                        "- `;gem status`: Detailed system status.\n"
                         "- `;gem model <id>`: Switch Gemini model.\n"
-                        "- `;gem timer <mins|perm>`: Set inactivity reset timer.\n"
                         "- `;gem autothink <on/off>`: Toggle native reasoning.\n"
                         "- `;gem statusmsg <on/off>`: Toggle loading messages.\n"
                         "- `;gem vertex <on/off>`: Toggle Vertex AI mode.\n"
@@ -822,16 +774,21 @@ class GeminiSelfBot(discord.Client):
                         "- `;gem join <invite>`: Join a Discord server.\n"
                         "- `;gem restart`: Force PM2 process restart.\n\n"
                         "> 🎭 **Persona Commands**\n"
-                        "- `;gem prompt <name>`: Switch channel personality.\n"
+                        "- `;gem prompt <name> [user]`: Switch user personality.\n"
                         "- `;gem prompts`: List all variations with descriptions.\n"
+                        "- `;gem status`: Show current personality and system status.\n"
                         "- `;gem help`: Show this list."
                     )
                     await message.reply(help_text)
                     return
 
         # 1. Ignore messages from yourself (to prevent infinite loops)
+        # Exception: Allow self-messages in server 1490733173246660658 if they start with ;gem
         if message.author.id == self.user.id:
-            return
+            if message.guild and message.guild.id == 1490733173246660658 and message.content.startswith(";gem"):
+                logger.info("Self-message detected in target server with prefix ;gem - processing.")
+            else:
+                return
             
         # 2. Ignore messages from other bots
         if message.author.bot:
@@ -839,11 +796,16 @@ class GeminiSelfBot(discord.Client):
 
         # 3. Check for triggers: Direct Mention or Reply to self
         is_mentioned = False
+        
+        # Exception: Self-messages starting with ;gem count as mentioned in target server
+        if message.author.id == self.user.id and message.guild and message.guild.id == 1490733173246660658 and message.content.startswith(";gem"):
+            is_mentioned = True
+
         if any(mention.id == self.user.id for mention in message.mentions):
             is_mentioned = True
             
-        # Also trigger if they explicitly type @gemini or gemini
-        if "@gemini" in message.content.lower() or "gemini," in message.content.lower():
+        # Also trigger if they explicitly type @gemini
+        if "@gemini" in message.content.lower():
             is_mentioned = True
             
         is_reply_to_self = False
@@ -872,7 +834,7 @@ class GeminiSelfBot(discord.Client):
             sub = parts[1].lower() if len(parts) > 1 else "help"
             
             if sub == "prompts" or (sub == "prompt" and len(parts) < 3):
-                settings = get_channel_settings(message.channel.id)
+                settings = get_user_settings(message.author.id)
                 current_var = settings.get('variation', 'default')
                 
                 desc_lines = []
@@ -889,10 +851,32 @@ class GeminiSelfBot(discord.Client):
                 return
 
             elif sub == "prompt":
+                if len(parts) < 3:
+                    await message.reply("> ❌ **Missing variation name.** Use `;gem prompts` to see the list.")
+                    return
+                    
                 target = parts[2].lower()
                 if target in config.PROMPT_MODIFIERS:
-                    save_channel_variation(message.channel.id, target)
-                    await message.reply(f"> ✅ **Personality shifted to:** `{target.capitalize()}`")
+                    target_user = message.author
+                    is_owner = message.author.id == 504541573636161546
+                    
+                    if len(parts) > 3 and is_owner:
+                        try:
+                            # Mentions format is <@id> or <@!id>
+                            user_str = parts[3].strip('<@!>')
+                            if not user_str.isdigit():
+                                raise ValueError()
+                            target_user_id = int(user_str)
+                            target_user = self.get_user(target_user_id) or await self.fetch_user(target_user_id)
+                        except Exception:
+                            await message.reply("> ❌ **Invalid user ID or mention.**")
+                            return
+                            
+                    save_user_variation(target_user.id, target)
+                    if target_user.id == message.author.id:
+                        await message.reply(f"> ✅ **Personality shifted to:** `{target.capitalize()}`")
+                    else:
+                        await message.reply(f"> ✅ **Personality for {target_user.name} shifted to:** `{target.capitalize()}`")
                 else:
                     await message.reply(f"> ❌ **Unknown variation:** `{target}`. Use `;gem prompts` to see the list.")
                 return
@@ -901,7 +885,7 @@ class GeminiSelfBot(discord.Client):
                 # Public restricted help
                 help_text = (
                     "> 🎭 **Gemini Persona Commands**\n"
-                    "- `;gem prompt <name>`: Switch the bot's personality for this channel.\n"
+                    "- `;gem prompt <name>`: Switch the bot's personality for yourself.\n"
                     "- `;gem prompts`: List all available personalities.\n"
                     "- `;gem status`: Show current personality and system status.\n"
                     "- `;gem help`: Show this message."
@@ -915,9 +899,9 @@ class GeminiSelfBot(discord.Client):
                 think_status = "🧠 ON" if config.AUTO_THINKING else "⚪ OFF"
                 queue_status = "⏳ ON" if config.ENABLE_QUEUE else "⚪ OFF"
                 
-                # Fetch channel-specific settings
-                chan_settings = get_channel_settings(message.channel.id)
-                variation = chan_settings.get('variation', 'default').capitalize()
+                # Fetch user-specific settings
+                user_settings = get_user_settings(message.author.id)
+                variation = user_settings.get('variation', 'default').capitalize()
                 
                 await message.reply(
                     f"> 📊 **System Status**\n"
@@ -933,8 +917,7 @@ class GeminiSelfBot(discord.Client):
         if not (is_mentioned or is_reply_to_self):
             return
             
-        # Update last activity for the channel consistently on any trigger
-        save_channel_activity(message.channel.id, time.time())
+
 
         # 4. Check for Pause State (Owner Exception)
         if config.IS_PAUSED and message.author.id != 504541573636161546:
@@ -1158,9 +1141,15 @@ class GeminiSelfBot(discord.Client):
         user_info_for_context = user_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
         other_for_context = other_users_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
         
-        # Fetch current channel personality
-        settings = get_channel_settings(message.channel.id)
+        # Fetch current user personality
+        settings = get_user_settings(message.author.id)
         variation = settings.get('variation', 'default')
+        
+        # Override with reply chain context if replying to the bot
+        if is_reply_to_self and message.reference and message.reference.message_id:
+            chained_variation = get_message_variation(message.reference.message_id)
+            if chained_variation:
+                variation = chained_variation
         
         messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info_for_context, other_users_info=other_for_context, bot_username=str(self.user), media_data=media_data, variation=variation)
 
@@ -1305,7 +1294,8 @@ class GeminiSelfBot(discord.Client):
                     tokens=session_tokens, 
                     tps=last_tps, 
                     show_stats=show_stats, 
-                    used_model=llm_res.get("model", "")
+                    used_model=llm_res.get("model", ""),
+                    variation=variation
                 )
                 increment_stats(messages=1)
                 return
@@ -1323,7 +1313,7 @@ class GeminiSelfBot(discord.Client):
                     pass
                 return
 
-    async def _send_safe_response(self, loading_msg: discord.Message | None, content: str, original_msg: discord.Message, tokens: int = 0, tps: float = 0.0, show_stats: bool = False, used_model: str = ""):
+    async def _send_safe_response(self, loading_msg: discord.Message | None, content: str, original_msg: discord.Message, tokens: int = 0, tps: float = 0.0, show_stats: bool = False, used_model: str = "", variation: str = "default"):
         """Helper to send responses that might exceed Discord's 2000 character limit, prioritizing newline splits.
         
         When loading_msg is None (SHOW_LOADING_MESSAGES=false), sends a fresh reply instead of editing.
@@ -1405,16 +1395,22 @@ class GeminiSelfBot(discord.Client):
                             await loading_msg.edit(content=chunk, attachments=files_to_attach)
                         else:
                             await loading_msg.edit(content=chunk)
+                        if variation and variation != 'default':
+                            save_message_variation(loading_msg.id, variation)
                     else:
                         if files_to_attach:
-                            await original_msg.reply(chunk, mention_author=False, files=files_to_attach)
+                            sent = await original_msg.reply(chunk, mention_author=False, files=files_to_attach)
                         else:
-                            await original_msg.reply(chunk, mention_author=False)
+                            sent = await original_msg.reply(chunk, mention_author=False)
+                        if sent and variation and variation != 'default':
+                            save_message_variation(sent.id, variation)
                 else:
                     if files_to_attach:
-                        await original_msg.channel.send(chunk, files=files_to_attach)
+                        sent = await original_msg.channel.send(chunk, files=files_to_attach)
                     else:
-                        await original_msg.channel.send(chunk)
+                        sent = await original_msg.channel.send(chunk)
+                    if sent and variation and variation != 'default':
+                        save_message_variation(sent.id, variation)
                     await asyncio.sleep(0.8)
             except Exception as e:
                 logger.error(f"Failed to send/edit message chunk {i}: {e}")

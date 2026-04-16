@@ -80,3 +80,30 @@ async def parse_duration(duration_str: str) -> int | None:
             return int(val * 604800)
             
     return None
+
+async def calculate_math(expression: str) -> dict:
+    """
+    Safely evaluate a mathematical expression.
+    """
+    import re
+    logger.info(f"Math requested: '{expression}'")
+    
+    # Clean expression and handle common shorthand
+    expression = expression.strip().replace("x", "*").replace("÷", "/")
+    
+    # Safety: Only allow digits, decimals, basic operators, parentheses, and whitespace
+    if not re.match(r'^[0-9\.\+\-\*\/\(\)\s\^]+$', expression):
+        return {"status": "error", "message": "Invalid characters in expression. Only numbers and basic operators are allowed."}
+    
+    try:
+        # Python's ** is handled via ^ for user convenience if needed, but let's stick to standard python
+        # replace ^ with **
+        expression = expression.replace("^", "**")
+        
+        # Use a restricted namespace for eval
+        # Note: While still eval, the regex above prevents complex object access.
+        result = eval(expression, {"__builtins__": None}, {})
+        return {"status": "success", "result": str(result)}
+    except Exception as e:
+        logger.error(f"Math calculation error: {e}")
+        return {"status": "error", "message": str(e)}

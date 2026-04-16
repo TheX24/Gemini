@@ -48,13 +48,19 @@ def init_db():
                 )
             """)
             
-            # Channel Settings table
+            # User Settings table
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS channel_settings (
-                    channel_id INTEGER PRIMARY KEY,
-                    variation TEXT DEFAULT 'default',
-                    last_activity REAL,
-                    timeout INTEGER DEFAULT 900
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id INTEGER PRIMARY KEY,
+                    variation TEXT DEFAULT 'default'
+                )
+            """)
+            
+            # Message Variations table for reply chains
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS message_variations (
+                    message_id INTEGER PRIMARY KEY,
+                    variation TEXT NOT NULL
                 )
             """)
             # Keyword Memories table (for global facts triggered by words)
@@ -176,76 +182,59 @@ def get_stats() -> Dict[str, int]:
         logger.error(f"Error fetching stats: {e}")
     return {"messages_answered": 0, "tokens_used": 0, "searches_run": 0, "tools_used": 0}
 
-# ── Channel Settings Management ──────────────────────────────────────────
+# ── User Settings Management ──────────────────────────────────────────
 
-def get_channel_settings(channel_id: int) -> Dict[str, Any]:
+def get_user_settings(user_id: int) -> Dict[str, Any]:
     try:
         with get_connection() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM channel_settings WHERE channel_id = ?", (channel_id,))
+            cursor.execute("SELECT * FROM user_settings WHERE user_id = ?", (user_id,))
             row = cursor.fetchone()
             if row:
                 return dict(row)
     except Exception as e:
-        logger.error(f"Error fetching channel settings for {channel_id}: {e}")
+        logger.error(f"Error fetching user settings for {user_id}: {e}")
     
     # Default return if not found
-    return {"variation": "default", "last_activity": time.time(), "timeout": 900}
+    return {"variation": "default"}
 
-def save_channel_variation(channel_id: int, variation: str):
+def save_user_variation(user_id: int, variation: str):
     try:
         with get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO channel_settings (channel_id, variation, last_activity) 
-                VALUES (?, ?, ?)
-                ON CONFLICT(channel_id) DO UPDATE SET 
-                    variation = excluded.variation,
-                    last_activity = excluded.last_activity
-            """, (channel_id, variation, time.time()))
-            conn.commit()
-    except Exception as e:
-        logger.error(f"Error saving channel variation: {e}")
-
-def save_channel_activity(channel_id: int, last_activity: float):
-    try:
-        with get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO channel_settings (channel_id, last_activity) 
+                INSERT INTO user_settings (user_id, variation) 
                 VALUES (?, ?)
-                ON CONFLICT(channel_id) DO UPDATE SET last_activity = excluded.last_activity
-            """, (channel_id, last_activity))
+                ON CONFLICT(user_id) DO UPDATE SET 
+                    variation = excluded.variation
+            """, (user_id, variation))
             conn.commit()
     except Exception as e:
-        logger.error(f"Error saving channel activity: {e}")
+        logger.error(f"Error saving user variation: {e}")
 
-def save_channel_timer(channel_id: int, timeout_seconds: int):
+def get_message_variation(message_id: int) -> str | None:
     try:
         with get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO channel_settings (channel_id, timeout) 
-                VALUES (?, ?)
-                ON CONFLICT(channel_id) DO UPDATE SET timeout = excluded.timeout
-            """, (channel_id, timeout_seconds))
-            conn.commit()
+            cursor.execute("SELECT variation FROM message_variations WHERE message_id = ?", (message_id,))
+            row = cursor.fetchone()
+            return row[0] if row else None
     except Exception as e:
-        logger.error(f"Error saving channel timer: {e}")
+        logger.error(f"Error fetching message variation for {message_id}: {e}")
+    return None
 
-def get_all_channel_settings() -> List[Dict[str, Any]]:
-    settings = []
+def save_message_variation(message_id: int, variation: str):
     try:
         with get_connection() as conn:
-            conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM channel_settings")
-            for row in cursor.fetchall():
-                settings.append(dict(row))
+            cursor.execute(
+                "INSERT OR REPLACE INTO message_variations (message_id, variation) VALUES (?, ?)",
+                (message_id, variation)
+            )
+            conn.commit()
     except Exception as e:
-        logger.error(f"Error fetching all channel settings: {e}")
-    return settings
+        logger.error(f"Error saving message variation: {e}")
 
 # ── System State Management ──────────────────────────────────────────────
 
