@@ -14,6 +14,18 @@ PHRASES_ACTION = config.PHRASES_ACTION
 PHRASES_PARSING = config.PHRASES_PARSING
 PHRASES_QUEUE = config.PHRASES_QUEUE
 
+# Error Mapping for LLM Responses
+LLM_ERROR_MAPPING = {
+    400: ("Invalid Argument", "Double check your request, something seems invalid!"),
+    401: ("Unauthenticated", "Authentication failed. My API key might be invalid."),
+    403: ("Permission Denied", "Permission denied. I don't have access to this resource."),
+    404: ("Not Found", "Model not found. It might be deprecated or non-existent."),
+    429: ("Resource Exhausted", "I'm a bit overwhelmed right now, please try again in a minute!"),
+    500: ("Internal Error", "Internal server error. Google's AI is having a moment."),
+    503: ("Service Unavailable", "Service unavailable. The AI is likely down or overloaded."),
+    504: ("Gateway Timeout", "Gateway timeout. The request took way too long."),
+}
+
 from context_builder import clean_mention, build_context
 from llm_client import ask_llm
 from gemini_client import get_client
@@ -1124,194 +1136,231 @@ class GeminiSelfBot(discord.Client):
         
         status_task = status_data.get("task") if status_data else None
         
-        # 1. Context Compression (Disabled for large context)
-        # Bypassing slow summarization LLM calls entirely to leverage Ollama's native KV Prompt Cache for instant evaluation.
-        recap = None
-        short_history = history
+        try:
+            # 1. Context Compression (Disabled for large context)
+            # Bypassing slow summarization LLM calls entirely to leverage Ollama's native KV Prompt Cache for instant evaluation.
+            recap = None
+            short_history = history
 
-        # 2. Extract internal bot flags and clean prompt BEFORE building context
-        show_stats = "--stats" in user_prompt.lower()
-        force_search_flag = "--search" in user_prompt.lower()
-        
-        for flag in ["--stats", "--search"]:
-            user_prompt = re.sub(rf"(?i){re.escape(flag)}\b", "", user_prompt)
-        user_prompt = " ".join(user_prompt.split()).strip()
-
-        # 3. Build final prompt structures
-        user_info_for_context = user_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
-        other_for_context = other_users_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
-        
-        # Fetch current user personality
-        settings = get_user_settings(message.author.id)
-        variation = settings.get('variation', 'default')
-        
-        # Override with reply chain context if replying to the bot
-        if is_reply_to_self and message.reference and message.reference.message_id:
-            chained_variation = get_message_variation(message.reference.message_id)
-            if chained_variation:
-                variation = chained_variation
-        
-        messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info_for_context, other_users_info=other_for_context, bot_username=str(self.user), media_data=media_data, variation=variation)
-
-        # Inject attachment content as a system message so the model can reason over the files
-        if attachments_text:
-            messages.insert(1, {
-                "role": "system",
-                "content": (
-                    "[Attached Files]:\n"
-                    "The user has shared the following file content. "
-                    "Refer to it when answering their question.\n\n"
-                    + attachments_text
-                )
-            })
-        
-        # 4. Fetch Persistent Memories (Author and Other Relevant Users)
-        mems_to_fetch = [(message.author.id, "You")]
-        if other_users_info:
-            for extra in other_users_info:
-                mems_to_fetch.append((extra.get('id'), extra.get('display_name') or extra.get('username')))
-        
-        # We process manually to ensure clear labeling
-        for u_id, name in mems_to_fetch:
-            if not u_id: continue
-            user_mems = get_memories(u_id)
-            if user_mems:
-                brain = "\n".join([f"- {m['key']}: {m['value']}" for m in user_mems])
-                label = f"[User Facts & Memory - {name} (ID: {u_id})]:"
-                messages.insert(1, {"role": "system", "content": f"{label}\n{brain}"})
-
-        # 5. Fetch Global Keyword Memories
-        all_keywords = get_keyword_memories()
-        if all_keywords:
-            matched_keywords = []
-            prompt_low = user_prompt.lower()
-            for kw_obj in all_keywords:
-                kw = kw_obj['keyword']
-                if re.search(rf'\b{re.escape(kw)}\b', prompt_low):
-                    matched_keywords.append(f"- {kw.capitalize()}: {kw_obj['value']}")
+            # 2. Extract internal bot flags and clean prompt BEFORE building context
+            show_stats = "--stats" in user_prompt.lower()
+            force_search_flag = "--search" in user_prompt.lower()
             
-            if matched_keywords:
-                kw_block = "\n".join(matched_keywords)
-                messages.insert(1, {"role": "system", "content": f"[Keyword Facts & Information]:\n{kw_block}"})
-        
-        curr_phrases = PHRASES_DEFAULT
-        # --- AGENTIC REACT LOOP ---
-        iteration = 0
-        max_iterations = 8
-        executed_tools = set() # Track to avoid infinite loops
-        
-        # Tracking session stats
-        session_tokens = 0
-        last_tps = 0.0
-        accumulated_thought = ""
-        think_enabled = config.AUTO_THINKING  # starts True if native thinking is on
-        
-        while iteration < max_iterations:
-            iteration += 1
+            for flag in ["--stats", "--search"]:
+                user_prompt = re.sub(rf"(?i){re.escape(flag)}\b", "", user_prompt)
+            user_prompt = " ".join(user_prompt.split()).strip()
+
+            # 3. Build final prompt structures
+            user_info_for_context = user_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
+            other_for_context = other_users_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
             
-            # Start/Restart rotation if needed
-            await safe_cancel_status(status_task)
-            status_task = asyncio.create_task(rotate_status(loading_msg, curr_phrases, original_msg=message))
-            if status_data: status_data["task"] = status_task
+            # Fetch current user personality
+            settings = get_user_settings(message.author.id)
+            variation = settings.get('variation', 'default')
             
-            try:
-                # 1. Call LLM
-                llm_res = await ask_llm(messages, client=self.ollama_http_client)
-                response = llm_res.get("content", "")
-                session_tokens += llm_res.get("tokens", 0)
-                last_tps = llm_res.get("tps", 0.0)
+            # Override with reply chain context if replying to the bot
+            if is_reply_to_self and message.reference and message.reference.message_id:
+                chained_variation = get_message_variation(message.reference.message_id)
+                if chained_variation:
+                    variation = chained_variation
+        
+            messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info_for_context, other_users_info=other_for_context, bot_username=str(self.user), media_data=media_data, variation=variation)
+
+            # Inject attachment content as a system message so the model can reason over the files
+            if attachments_text:
+                messages.insert(1, {
+                    "role": "system",
+                    "content": (
+                        "[Attached Files]:\n"
+                        "The user has shared the following file content. "
+                        "Refer to it when answering their question.\n\n"
+                        + attachments_text
+                    )
+                })
+            
+            # 4. Fetch Persistent Memories (Author and Other Relevant Users)
+            mems_to_fetch = [(message.author.id, "You")]
+            if other_users_info:
+                for extra in other_users_info:
+                    mems_to_fetch.append((extra.get('id'), extra.get('display_name') or extra.get('username')))
+            
+            # We process manually to ensure clear labeling
+            for u_id, name in mems_to_fetch:
+                if not u_id: continue
+                user_mems = get_memories(u_id)
+                if user_mems:
+                    brain = "\n".join([f"- {m['key']}: {m['value']}" for m in user_mems])
+                    label = f"[User Facts & Memory - {name} (ID: {u_id})]:"
+                    messages.insert(1, {"role": "system", "content": f"{label}\n{brain}"})
+
+            # 5. Fetch Global Keyword Memories
+            all_keywords = get_keyword_memories()
+            if all_keywords:
+                matched_keywords = []
+                prompt_low = user_prompt.lower()
+                for kw_obj in all_keywords:
+                    kw = kw_obj['keyword']
+                    if re.search(rf'\b{re.escape(kw)}\b', prompt_low):
+                        matched_keywords.append(f"- {kw.capitalize()}: {kw_obj['value']}")
                 
-                # Capture native reasoning parts
-                if llm_res.get("thought"):
-                    accumulated_thought += llm_res["thought"] + "\n"
+                if matched_keywords:
+                    kw_block = "\n".join(matched_keywords)
+                    messages.insert(1, {"role": "system", "content": f"[Keyword Facts & Information]:\n{kw_block}"})
+            
+            curr_phrases = PHRASES_DEFAULT
+            # --- AGENTIC REACT LOOP ---
+            iteration = 0
+            max_iterations = 8
+            executed_tools = set() # Track to avoid infinite loops
+            
+            # Tracking session stats
+            session_tokens = 0
+            last_tps = 0.0
+            accumulated_thought = ""
+            think_enabled = config.AUTO_THINKING  # starts True if native thinking is on
+            
+            while iteration < max_iterations:
+                iteration += 1
                 
-                if not response or response.strip() == "":
-                    logger.error(f"Error in agent loop iteration {iteration}: Empty response.")
-                    if think_enabled:
-                        response = "I have finished my reasoning process. How can I help you further?"
-                    else:
-                        break
-
-                # Detect LLM error strings and suppress them (don't send to Discord)
-                if response.startswith("Error communicating") or response.startswith("Error:"):
-                    logger.warning(f"LLM returned error string on iteration {iteration}, suppressing: {response[:100]}")
-                    break
-                
-
-                # 3. Legacy Mode Switch: [MODE: think] — only active when AUTO_THINKING is OFF
-                if not config.AUTO_THINKING and "[MODE: think]" in response and not think_enabled:
-                    logger.info("Model requested Legacy Thinking Mode.")
-                    think_enabled = True
-                    curr_phrases = PHRASES_HYBRID if curr_phrases in (PHRASES_SEARCH, PHRASES_ACTION) else PHRASES_THINK
-
-                    clean_resp = response.replace("[MODE: think]", "").strip()
-                    if clean_resp:
-                        messages.append({"role": "assistant", "content": clean_resp})
-                    messages.append({"role": "system", "content": "[DIRECTIVE]: You are now in Thinking Mode. Provide a detailed, step-by-step reasoning chain before your final answer."})
-                    continue
-
-                # 4. Action: [ACTION: tool(args)]
-                action_match = re.search(r'\[ACTION:\s*(\w+)(?:\s*\((.*?)\))?\]', response)
-                if not action_match:
-                    # Fallback if the LLM forgets the [ACTION:] wrapper but explicitly typed the tool name
-                    action_match = None
-                    
-                if action_match:
-                    tool_name = action_match.group(1).lower()
-                    tool_args = action_match.group(2) or ""
-                    tool_id = f"{tool_name}:{tool_args}"
-                    
-                    if tool_id in executed_tools:
-                        logger.warning(f"Model repeated tool call: {tool_id}. Breaking loop.")
-                        break
-                        
-                    logger.info(f"Model triggered tool: {tool_name}({tool_args})")
-                    executed_tools.add(tool_id)
-                    
-                    # Update phrases for the next iteration
-                    curr_phrases = PHRASES_HYBRID if config.AUTO_THINKING else PHRASES_ACTION
-
-                    tool_result = await self._dispatch_tool(tool_name, tool_args, message, loading_msg)
-                    
-                    if tool_result == "HANDLED_UI":
-                        await safe_cancel_status(status_task)
-                        return
-                        
-                    messages.append({"role": "assistant", "content": response})
-                    messages.append({"role": "user", "content": f"[TOOL_RESULT]: {tool_result}"})
-                    continue
-
-
-                # 5. Final Response formatting
+                # Start/Restart rotation if needed
                 await safe_cancel_status(status_task)
-                if status_data: status_data["task"] = None
+                status_task = asyncio.create_task(rotate_status(loading_msg, curr_phrases, original_msg=message))
+                if status_data: status_data["task"] = status_task
                 
-                # Note: accumulated_thought is kept internally for quality but not displayed per user preference
-                await self._send_safe_response(
-                    loading_msg, 
-                    response, 
-                    message, 
-                    tokens=session_tokens, 
-                    tps=last_tps, 
-                    show_stats=show_stats, 
-                    used_model=llm_res.get("model", ""),
-                    variation=variation
-                )
-                increment_stats(messages=1)
-                return
-
-            except Exception as e:
-                await safe_cancel_status(status_task)
-                logger.error(f"Error in agent loop iteration {iteration}: {e}")
                 try:
-                    err_text = f"⚠️ **Error:** {str(e)[:1800]}"
-                    if loading_msg:
-                        await loading_msg.edit(content=err_text)
-                    else:
-                        await message.reply(err_text)
-                except:
-                    pass
-                return
+                    # 1. Call LLM
+                    llm_res = await ask_llm(messages, client=self.ollama_http_client)
+                    response = llm_res.get("content", "")
+                    session_tokens += llm_res.get("tokens", 0)
+                    last_tps = llm_res.get("tps", 0.0)
+                    
+                    # Capture native reasoning parts
+                    if llm_res.get("thought"):
+                        accumulated_thought += llm_res["thought"] + "\n"
+                    
+                    if not response or response.strip() == "":
+                        logger.error(f"Error in agent loop iteration {iteration}: Empty response.")
+                        if think_enabled:
+                            response = "I have finished my reasoning process. How can I help you further?"
+                        else:
+                            break
+
+                    # Detect LLM error strings and format them
+                    if response.startswith("🚨 [LLM_ERROR]"):
+                        error_code = llm_res.get("error_code")
+                        status_str, friendly_msg = LLM_ERROR_MAPPING.get(error_code, ("Unknown Error", "Oops! I encountered an unexpected error."))
+                        
+                        response = f"{friendly_msg}\n-# Error code: {error_code}, {status_str}"
+                        
+                        # Log and break to send this error as the final response
+                        logger.warning(f"LLM returned error on iteration {iteration}: {response[:100]}")
+                        
+                        # We exit the iteration loop and send the response
+                        await self._send_safe_response(
+                            loading_msg, 
+                            response, 
+                            message, 
+                            tokens=session_tokens, 
+                            tps=last_tps, 
+                            show_stats=show_stats, 
+                            used_model=llm_res.get("model", ""),
+                            variation=variation
+                        )
+                        return
+                    
+                    # 2. Silence Directive: [NO_RESPONSE]
+                    if "[NO_RESPONSE]" in response:
+                        logger.info(f"LLM triggered [NO_RESPONSE] on iteration {iteration}.")
+                        await safe_cancel_status(status_task)
+                        if status_data: status_data["task"] = None
+                        if loading_msg:
+                            try:
+                                await loading_msg.delete()
+                            except:
+                                pass
+                        return
+                    
+
+                    # 3. Legacy Mode Switch: [MODE: think] — only active when AUTO_THINKING is OFF
+                    if not config.AUTO_THINKING and "[MODE: think]" in response and not think_enabled:
+                        logger.info("Model requested Legacy Thinking Mode.")
+                        think_enabled = True
+                        curr_phrases = PHRASES_HYBRID if curr_phrases in (PHRASES_SEARCH, PHRASES_ACTION) else PHRASES_THINK
+
+                        clean_resp = response.replace("[MODE: think]", "").strip()
+                        if clean_resp:
+                            messages.append({"role": "assistant", "content": clean_resp})
+                        messages.append({"role": "system", "content": "[DIRECTIVE]: You are now in Thinking Mode. Provide a detailed, step-by-step reasoning chain before your final answer."})
+                        continue
+
+                    # 4. Action: [ACTION: tool(args)]
+                    action_match = re.search(r'\[ACTION:\s*(\w+)(?:\s*\((.*?)\))?\]', response)
+                    if not action_match:
+                        # Fallback if the LLM forgets the [ACTION:] wrapper but explicitly typed the tool name
+                        action_match = None
+                        
+                    if action_match:
+                        tool_name = action_match.group(1).lower()
+                        tool_args = action_match.group(2) or ""
+                        tool_id = f"{tool_name}:{tool_args}"
+                        
+                        if tool_id in executed_tools:
+                            logger.warning(f"Model repeated tool call: {tool_id}. Breaking loop.")
+                            break
+                            
+                        logger.info(f"Model triggered tool: {tool_name}({tool_args})")
+                        executed_tools.add(tool_id)
+                        
+                        # Update phrases for the next iteration
+                        curr_phrases = PHRASES_HYBRID if config.AUTO_THINKING else PHRASES_ACTION
+
+                        tool_result = await self._dispatch_tool(tool_name, tool_args, message, loading_msg)
+                        
+                        if tool_result == "HANDLED_UI":
+                            await safe_cancel_status(status_task)
+                            return
+                            
+                        messages.append({"role": "assistant", "content": response})
+                        messages.append({"role": "user", "content": f"[TOOL_RESULT]: {tool_result}"})
+                        continue
+
+
+                    # 5. Final Response formatting
+                    await safe_cancel_status(status_task)
+                    if status_data: status_data["task"] = None
+                    
+                    # Note: accumulated_thought is kept internally for quality but not displayed per user preference
+                    await self._send_safe_response(
+                        loading_msg, 
+                        response, 
+                        message, 
+                        tokens=session_tokens, 
+                        tps=last_tps, 
+                        show_stats=show_stats, 
+                        used_model=llm_res.get("model", ""),
+                        variation=variation
+                    )
+                    increment_stats(messages=1)
+                    return
+
+                except Exception as e:
+                    logger.error(f"Error in agent loop iteration {iteration}: {e}")
+                    # On fatal LLM logic errors, break the loop to avoid infinite stuck states
+                    break
+
+        except Exception as e:
+            logger.error(f"Error in process_queued_prompt: {e}", exc_info=True)
+            try:
+                err_text = f"⚠️ **Critical Error:** {str(e)[:1800]}"
+                if loading_msg:
+                    await loading_msg.edit(content=err_text)
+                else:
+                    await message.reply(err_text)
+            except:
+                pass
+        finally:
+            # ALWAYS ensure the typing/loading status is cancelled
+            await safe_cancel_status(status_task)
 
     async def _send_safe_response(self, loading_msg: discord.Message | None, content: str, original_msg: discord.Message, tokens: int = 0, tps: float = 0.0, show_stats: bool = False, used_model: str = "", variation: str = "default"):
         """Helper to send responses that might exceed Discord's 2000 character limit, prioritizing newline splits.
