@@ -208,3 +208,10 @@ IS_PAUSED = os.getenv("IS_PAUSED", "false").lower() in ("true", "1", "yes")
 AUTO_THINKING = os.getenv("AUTO_THINKING", "false").lower() in ("true", "1", "yes")
 ENABLE_QUEUE = os.getenv("ENABLE_QUEUE", "true").lower() in ("true", "1", "yes")
 THINKING_BUDGET = int(os.getenv("THINKING_BUDGET", "1024"))
+
+# Attachment Limits
+MAX_ATTACHMENT_BYTES = int(os.getenv("MAX_ATTACHMENT_BYTES", "25000000")) # 25 MB
+MAX_ATTACHMENT_COUNT = int(os.getenv("MAX_ATTACHMENT_COUNT", "20"))
+MAX_MEDIA_BYTES = int(os.getenv("MAX_MEDIA_BYTES", "50000000")) # 50 MB
+MAX_TEXT_EMBED_BYTES = int(os.getenv("MAX_TEXT_EMBED_BYTES", "100000")) # 100 KB
+CHANNEL_HISTORY_LIMIT = int(os.getenv("CHANNEL_HISTORY_LIMIT", "50"))

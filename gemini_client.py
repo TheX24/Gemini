@@ -83,8 +83,17 @@ async def ask_gemini(messages: list, client: any = None, model: str = None) -> d
                 mime_type = item.get("mime_type", "image/jpeg")
                 if mime_type.startswith("audio/"):
                     has_audio = True
+                
+                data = item.get("data", b"")
+                if isinstance(data, str):
+                    import base64
+                    try:
+                        data = base64.b64decode(data)
+                    except Exception:
+                        pass # Fallback to original if not valid base64
+                
                 parts.append(types.Part.from_bytes(
-                    data=item.get("data", b""),
+                    data=data,
                     mime_type=mime_type
                 ))
             
@@ -155,12 +164,23 @@ async def ask_gemini(messages: list, client: any = None, model: str = None) -> d
         content_out = ""
         
         if response.candidates and response.candidates[0].content:
-            for part in response.candidates[0].content.parts:
-                if part.text and not (hasattr(part, "thought") and part.thought):
-                    content_out += part.text
+            parts = response.candidates[0].content.parts
+            if parts:
+                for part in parts:
+                    if part.text and not (hasattr(part, "thought") and part.thought):
+                        content_out += part.text
                     
         if not content_out:
-            content_out = "No response generated."
+            if response.candidates and response.candidates[0].finish_reason:
+                reason = response.candidates[0].finish_reason
+                if reason == "SAFETY":
+                    content_out = "Response blocked by safety filters."
+                elif reason == "RECITATION":
+                    content_out = "Response blocked due to recitation (copyright) filters."
+                else:
+                    content_out = f"No response generated (Finish Reason: {reason})."
+            else:
+                content_out = "No response generated."
         
         increment_stats(tokens=total_tokens)
         

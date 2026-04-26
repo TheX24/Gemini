@@ -64,8 +64,11 @@ async def _call_ollama(messages: list, client: httpx.AsyncClient, model: str) ->
         
     except Exception as e:
         logger.error(f"Ollama Request Failed: {str(e)}")
+        # Map connection errors to 503 Service Unavailable
+        err_code = 503 if "connection" in str(e).lower() or "attempt" in str(e).lower() else 500
         return {
-            "content": f"Error communicating with local LLM: {str(e)}",
+            "content": f"🚨 [LLM_ERROR]: Local LLM: {str(e)}",
+            "error_code": err_code,
             "tokens": 0,
             "tps": 0.0
         }

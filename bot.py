@@ -47,21 +47,6 @@ import os
 # File attachment security policy
 # ---------------------------------------------------------------------------
 # Only these plain-text extensions are allowed.  Everything else is blocked.
-ALLOWED_TEXT_EXTENSIONS: set[str] = {
-    ".txt", ".log", ".md", ".markdown", ".rst",
-    ".csv", ".tsv", ".json", ".yaml", ".yml",
-    ".toml", ".ini", ".cfg", ".conf", ".env",
-    ".xml", ".html", ".htm", ".css",
-    ".diff", ".patch", ".ttml",
-    # Programming Languages & Scripts
-    ".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
-    ".sh", ".bash", ".zsh", ".fish", ".ksh", ".csh",
-    ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp",
-    ".cs", ".go", ".rs", ".swift", ".kt", ".kts",
-    ".rb", ".rbw", ".pl", ".pm", ".php", ".phtml",
-    ".lua", ".r", ".rscript", ".java", ".sql", ".dart",
-}
-
 # Hard block list – binaries, compiled code, or containers.
 # This ensures the bot doesn't attempt to read non-text data.
 BLOCKED_EXTENSIONS: set[str] = {
@@ -69,133 +54,79 @@ BLOCKED_EXTENSIONS: set[str] = {
     ".exe", ".dll", ".so", ".dylib", ".elf", ".bin", ".out", ".run",
     ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
     ".iso", ".img", ".dmg",
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
 }
 
-MAX_ATTACHMENT_BYTES = 50_000  # Bytes per file
-MAX_ATTACHMENT_FILES = 5
-
-# Multimedia attachments — handled natively via Gemini
-ALLOWED_MEDIA_EXTENSIONS: set[str] = {
-    ".png", ".jpg", ".jpeg", ".webp", ".gif",
-    ".mp4", ".mp3", ".wav", ".flac", ".ogg", ".avi", ".mkv", ".mov", ".webm", ".heic"
-}
-MAX_MEDIA_BYTES = 10_000_000  # 10 MB per file
-MAX_MEDIA_FILES = 3
-
-async def read_text_attachments(attachments: list[discord.Attachment]) -> tuple[str | None, str | None]:
+async def read_attachments(attachments: list[discord.Attachment]) -> tuple[list[dict], str | None]:
     """
-    Download and validate text attachments from a Discord message.
+    Download and validate all attachments from a Discord message.
     
     Returns:
-        (combined_text, error_message)  – exactly one will be non-None.
+        (list_of_media_dicts, error_message)
     """
+    import mimetypes
     if not attachments:
-        return None, None
+        return [], None
 
     # Respect the per-message file cap
-    attachments = attachments[:MAX_ATTACHMENT_FILES]
+    attachments = attachments[:config.MAX_ATTACHMENT_COUNT]
 
-    parts: list[str] = []
+    results: list[dict] = []
     for att in attachments:
         ext = os.path.splitext(att.filename)[1].lower()
 
         # Block executables / binaries first (deny always wins)
         if ext in BLOCKED_EXTENSIONS:
-            return None, (
+            return [], (
                 f"🚫 **Blocked:** `{att.filename}` has a potentially executable extension (`{ext}`). "
                 "I cannot read files that could be executed for security reasons."
             )
 
-        # Only accept explicitly allowed plain-text types
-        if ext not in ALLOWED_TEXT_EXTENSIONS:
-            return None, (
-                f"❌ **Unsupported file type:** `{att.filename}` (`{ext}`). "
-                f"Allowed plain-text types: {', '.join(sorted(ALLOWED_TEXT_EXTENSIONS))}"
-            )
-
         # Size guard
-        if att.size > MAX_ATTACHMENT_BYTES:
-            size_kb = att.size // 1024
-            return None, (
-                f"❌ **File too large:** `{att.filename}` is {size_kb} KB. "
-                f"Maximum size per file is {MAX_ATTACHMENT_BYTES // 1024} KB."
+        if att.size > config.MAX_MEDIA_BYTES:
+            size_mb = att.size / 1_000_000
+            return [], (
+                f"❌ **File too large:** `{att.filename}` is {size_mb:.1f} MB. "
+                f"Maximum size per file is {config.MAX_MEDIA_BYTES // 1_000_000} MB."
             )
 
         # Download the file content
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.get(att.url)
                 resp.raise_for_status()
-                text = resp.text
-        except Exception as e:
-            return None, f"❌ **Failed to read** `{att.filename}`: {e}"
-
-        parts.append(f"### Attached file: `{att.filename}`\n```\n{text}\n```")
-
-    if not parts:
-        return None, None
-
-    combined = "\n\n".join(parts)
-    return combined, None
-
-
-async def read_media_attachments(
-    attachments: list[discord.Attachment]
-) -> tuple[list[dict] | None, str | None]:
-    """
-    Download and validate media attachments from a Discord message.
-
-    Returns:
-        (list_of_media_dicts, error_message) — exactly one will be non-None.
-        Each dict has 'mime_type' and 'data' (bytes).
-    """
-    import mimetypes
-    
-    media_atts = [
-        a for a in attachments
-        if os.path.splitext(a.filename)[1].lower() in ALLOWED_MEDIA_EXTENSIONS or getattr(a, "is_voice_message", lambda: False)()
-    ][:MAX_MEDIA_FILES]
-
-    if not media_atts:
-        return None, None
-
-    media_list: list[dict] = []
-    for att in media_atts:
-        if att.size > MAX_MEDIA_BYTES:
-            size_mb = att.size / 1_000_000
-            return None, (
-                f"❌ **Media too large:** `{att.filename}` is {size_mb:.1f} MB. "
-                f"Maximum per file is {MAX_MEDIA_BYTES // 1_000_000} MB."
-            )
-
-        # Download the raw bytes
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.get(att.url)
-                resp.raise_for_status()
+                data = resp.content
+                
                 mime_type, _ = mimetypes.guess_type(att.filename)
                 if getattr(att, "is_voice_message", lambda: False)():
                     mime_type = "audio/ogg"
-                elif not mime_type:
-                    # fallback
-                    ext = os.path.splitext(att.filename)[1].lower()
-                    if ext == ".mp4": mime_type = "video/mp4"
-                    elif ext == ".mp3": mime_type = "audio/mp3"
-                    elif ext == ".wav": mime_type = "audio/wav"
-                    elif ext == ".ogg": mime_type = "audio/ogg"
-                    elif ext == ".webm": mime_type = "video/webm"
-                    elif ext == ".mov": mime_type = "video/quicktime"
-                    else: mime_type = "image/jpeg"
-                media_list.append({"mime_type": mime_type, "data": resp.content, "filename": att.filename})
+                
+                # Expand guessing for Gemini-friendly types and avoid application/octet-stream
+                if not mime_type or mime_type == "application/octet-stream":
+                    # Text/Code fallbacks
+                    if ext in [
+                        ".py", ".js", ".ts", ".tsx", ".jsx", ".c", ".cpp", ".cc", ".h", ".hpp", 
+                        ".cs", ".go", ".rs", ".md", ".markdown", ".json", ".yaml", ".yml", 
+                        ".toml", ".sql", ".sh", ".bash", ".zsh", ".env", ".log", ".txt"
+                    ]:
+                        mime_type = "text/plain"
+                    elif ext == ".pdf":
+                        mime_type = "application/pdf"
+                    else:
+                        # Gemini rejects application/octet-stream for inline data.
+                        # Defaulting to text/plain is safer; if it's actually binary, 
+                        # the model will just see it as encoded characters.
+                        mime_type = "text/plain"
+                
+                results.append({
+                    "filename": att.filename,
+                    "mime_type": mime_type,
+                    "data": data,
+                    "size": att.size
+                })
         except Exception as e:
-            return None, f"❌ **Failed to download** `{att.filename}`: {e}"
+            return [], f"❌ **Failed to download** `{att.filename}`: {e}"
 
-    if not media_list:
-        return None, None
-
-    return media_list, None
-
+    return results, None
 
 # Set up logging for the bot
 logger = logging.getLogger(__name__)
@@ -967,27 +898,31 @@ class GeminiSelfBot(discord.Client):
             except discord.HTTPException:
                 pass
 
-        # 3. Handle Text Attachments
-        text_atts = [a for a in all_attachments if os.path.splitext(a.filename)[1].lower() in ALLOWED_TEXT_EXTENSIONS]
-        if text_atts:
-            attachments_text, att_error = await read_text_attachments(text_atts)
-            if att_error:
-                await message.reply(f"> {att_error}")
-                return
-            if attachments_text:
-                logger.info(f"Loaded {len(text_atts)} text attachment(s)")
-
-        # 4. Handle Media Attachments (Images/Audio/Video Native Direct and Voice Messages)
-        media_atts = [a for a in all_attachments if os.path.splitext(a.filename)[1].lower() in ALLOWED_MEDIA_EXTENSIONS or getattr(a, "is_voice_message", lambda: False)()]
-        media_data = None
-        if media_atts:
-            # Run image/media download (native)
-            media_data, img_err = await read_media_attachments(media_atts)
-            if img_err:
-                await message.reply(f"> ❌ **Media Download Failed:** {img_err}")
+        # 3. Handle All Attachments
+        attachments_text = ""
+        media_data = []
+        if all_attachments:
+            results, att_err = await read_attachments(all_attachments)
+            if att_err:
+                await message.reply(f"> {att_err}")
                 return
             
-            logger.info(f"Prepared {len(media_atts)} media file(s) for direct multimodal inference")
+            for item in results:
+                # If it's small and potentially text-based, embed it directly in the prompt
+                is_embedded = False
+                if item["size"] < config.MAX_TEXT_EMBED_BYTES:
+                    try:
+                        text_content = item["data"].decode("utf-8")
+                        attachments_text += f"### Attached file: `{item['filename']}`\n```\n{text_content}\n```\n\n"
+                        is_embedded = True
+                        logger.info(f"Embedded text file: {item['filename']}")
+                    except UnicodeDecodeError:
+                        pass # Not text, treat as media part
+                
+                # Always pass images, videos, and large/binary files as media parts
+                if not is_embedded or item["mime_type"].startswith(("image/", "video/", "audio/")):
+                    media_data.append(item)
+                    logger.info(f"Prepared media part: {item['filename']} ({item['mime_type']})")
 
         # 5. Early exit if no content to process
         is_reply = message.reference is not None
@@ -1014,7 +949,7 @@ class GeminiSelfBot(discord.Client):
         # 5. Fetch Channel History (Context awareness)
         history = []
         recent_users_map = {}
-        async for msg in message.channel.history(limit=50):
+        async for msg in message.channel.history(limit=config.CHANNEL_HISTORY_LIMIT):
              if msg.id == message.id: continue # Skip the current trigger message
              history.append({"author": str(msg.author), "content": msg.content})
              if msg.author.id not in recent_users_map and msg.author.id != self.user.id and msg.author.id != message.author.id:
@@ -1583,7 +1518,7 @@ class GeminiSelfBot(discord.Client):
                 return "HANDLED_UI"
                 
             elif name == "summarize":
-                limit = int(clean_args) if clean_args.isdigit() else 50
+                limit = int(clean_args) if clean_args.isdigit() else config.CHANNEL_HISTORY_LIMIT
                 history = [msg async for msg in message.channel.history(limit=limit, before=message) if msg.author.id != self.user.id]
                 transcript = "\n".join([f"{m.author.name}: {m.content}" for m in reversed(history)])
                 return f"Transcribed History:\n{transcript}"
