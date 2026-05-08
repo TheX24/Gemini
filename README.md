@@ -1,6 +1,9 @@
-![@Gemini](gemini.png)
-
 # @Gemini Discord Self-Bot
+
+> [!CAUTION]
+> Bot will no longer receive updates or be maintained.
+
+![@Gemini](gemini.png)
 
 A powerful, stateful, and lightning-fast personal assistant for Discord. Powered by local **Ollama** (`qwen3:8b`) and built with a modular, tool-intelligent architecture.
 
