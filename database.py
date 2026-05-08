@@ -79,6 +79,29 @@ def init_db():
                 )
             """)
             
+            # Whitelist table for privileged commands
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS whitelist (
+                    user_id INTEGER PRIMARY KEY
+                )
+            """)
+            
+            # Channel Settings table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS channel_settings (
+                    channel_id INTEGER PRIMARY KEY,
+                    variation TEXT DEFAULT 'default'
+                )
+            """)
+            
+            # Server Settings table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS server_settings (
+                    server_id INTEGER PRIMARY KEY,
+                    variation TEXT DEFAULT 'default'
+                )
+            """)
+            
             # Initialize exactly one row
             cursor.execute("INSERT OR IGNORE INTO stats (id) VALUES (1)")
             
@@ -177,7 +200,14 @@ def get_stats() -> Dict[str, int]:
             cursor.execute("SELECT * FROM stats WHERE id = 1")
             row = cursor.fetchone()
             if row:
-                return dict(row)
+                res = dict(row)
+                # Ensure we don't return None for any of these
+                return {
+                    "messages_answered": res.get("messages_answered") or 0,
+                    "tokens_used": res.get("tokens_used") or 0,
+                    "searches_run": res.get("searches_run") or 0,
+                    "tools_used": res.get("tools_used") or 0
+                }
     except Exception as e:
         logger.error(f"Error fetching stats: {e}")
     return {"messages_answered": 0, "tokens_used": 0, "searches_run": 0, "tools_used": 0}
@@ -212,6 +242,60 @@ def save_user_variation(user_id: int, variation: str):
             conn.commit()
     except Exception as e:
         logger.error(f"Error saving user variation: {e}")
+
+def get_channel_settings(channel_id: int) -> Dict[str, Any]:
+    try:
+        with get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM channel_settings WHERE channel_id = ?", (channel_id,))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+    except Exception as e:
+        logger.error(f"Error fetching channel settings for {channel_id}: {e}")
+    return {"variation": "default"}
+
+def save_channel_variation(channel_id: int, variation: str):
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO channel_settings (channel_id, variation) 
+                VALUES (?, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET 
+                    variation = excluded.variation
+            """, (channel_id, variation))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error saving channel variation: {e}")
+
+def get_server_settings(server_id: int) -> Dict[str, Any]:
+    try:
+        with get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM server_settings WHERE server_id = ?", (server_id,))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+    except Exception as e:
+        logger.error(f"Error fetching server settings for {server_id}: {e}")
+    return {"variation": "default"}
+
+def save_server_variation(server_id: int, variation: str):
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO server_settings (server_id, variation) 
+                VALUES (?, ?)
+                ON CONFLICT(server_id) DO UPDATE SET 
+                    variation = excluded.variation
+            """, (server_id, variation))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error saving server variation: {e}")
 
 def get_message_variation(message_id: int) -> str | None:
     try:
@@ -288,3 +372,72 @@ def get_keyword_memories() -> List[Dict[str, str]]:
     except Exception as e:
         logger.error(f"Error fetching keyword memories: {e}")
     return mems
+
+# ── Whitelist Management ──────────────────────────────────────────────
+
+def add_to_whitelist(user_id: int) -> bool:
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR IGNORE INTO whitelist (user_id) VALUES (?)", (user_id,))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Error adding to whitelist: {e}")
+        return False
+
+def remove_from_whitelist(user_id: int) -> bool:
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM whitelist WHERE user_id = ?", (user_id,))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Error removing from whitelist: {e}")
+        return False
+
+def is_whitelisted(user_id: int) -> bool:
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM whitelist WHERE user_id = ?", (user_id,))
+            return cursor.fetchone() is not None
+    except Exception as e:
+        logger.error(f"Error checking whitelist: {e}")
+        return False
+
+def toggle_whitelist(user_id: int) -> bool:
+    """Toggles whitelisted status. Returns new status."""
+    try:
+        current = is_whitelisted(user_id)
+        if current:
+            remove_from_whitelist(user_id)
+            return False
+        else:
+            add_to_whitelist(user_id)
+            return True
+    except Exception as e:
+        logger.error(f"Error toggling whitelist: {e}")
+        return False
+
+# ── Budget Management ────────────────────────────────────────────────
+
+def get_budget_spent() -> float:
+    """Returns the total spent today. Resets if date changed."""
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    last_reset = get_system_state("budget_last_reset")
+    
+    if last_reset != today:
+        save_system_state("budget_spent_today", "0.0")
+        save_system_state("budget_last_reset", today)
+        return 0.0
+    
+    spent_str = get_system_state("budget_spent_today")
+    return float(spent_str) if spent_str else 0.0
+
+def add_to_budget_spent(amount: float):
+    current = get_budget_spent()
+    new_total = current + amount
+    save_system_state("budget_spent_today", str(new_total))
+

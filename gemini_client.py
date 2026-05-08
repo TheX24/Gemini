@@ -14,22 +14,20 @@ import re
 
 logger = logging.getLogger(__name__)
 
-# Initialize client lazily
-_client = None
-_last_mode = None
+# Initialize clients lazily
+_clients = {}
 
-def get_client():
-    global _client, _last_mode
+def get_client(location: str = None):
+    global _clients
     
-    # Check if we need to re-initialize due to mode switch
     current_mode = config.USE_VERTEX_AI
-    if _client is not None and _last_mode != current_mode:
-        logger.info(f"Mode switch detected (Vertex: {_last_mode} -> {current_mode}). Re-initializing client.")
-        _client = None
-        
-    if _client is None:
-        _last_mode = current_mode
-        if config.USE_VERTEX_AI:
+    target_location = location or config.GOOGLE_CLOUD_LOCATION
+    
+    # Key for caching: (mode, location)
+    cache_key = (current_mode, target_location)
+    
+    if cache_key not in _clients:
+        if current_mode:
             import google.auth
             creds = None
             sa_path = '/home/spam_inhaler_tx24/@Gemini/service_account.json'
@@ -39,27 +37,28 @@ def get_client():
                     scopes=['https://www.googleapis.com/auth/cloud-platform']
                 )
             
-            # Use 'global' location as required for some preview models in Vertex AI 2026
-            logger.info(f"Initializing Vertex AI Client (Project: {config.GOOGLE_CLOUD_PROJECT}, Location: global)")
-            _client = genai.Client(
+            logger.info(f"Initializing Vertex AI Client (Project: {config.GOOGLE_CLOUD_PROJECT}, Location: {target_location})")
+            _clients[cache_key] = genai.Client(
                 vertexai=True, 
                 project=config.GOOGLE_CLOUD_PROJECT, 
-                location='global',
+                location=target_location,
                 credentials=creds
             )
         else:
             if not config.GEMINI_API_KEY:
                 raise ValueError("GEMINI_API_KEY is required for AI Studio.")
             logger.info("Initializing AI Studio Client")
-            _client = genai.Client(api_key=config.GEMINI_API_KEY)
-    return _client
+            _clients[cache_key] = genai.Client(api_key=config.GEMINI_API_KEY)
+            
+    return _clients[cache_key]
 
 async def ask_gemini(messages: list, client: any = None, model: str = None) -> dict:
     """
     Asynchronously ask the Gemini API using the new google-genai SDK.
     Returns a dict: {"content": str, "tokens": int, "tps": float, "grounding_metadata": ...}
     """
-    genai_client = get_client()
+    # Use 'global' for standard text generation in Vertex AI
+    genai_client = get_client(location='global' if config.USE_VERTEX_AI else None)
     used_model = model or config.GEMINI_MODEL
     
     contents = []
@@ -182,7 +181,6 @@ async def ask_gemini(messages: list, client: any = None, model: str = None) -> d
             else:
                 content_out = "No response generated."
         
-        increment_stats(tokens=total_tokens)
         
         return {
             "content": content_out,

@@ -1,4 +1,6 @@
-discord.py-self
+discord.py-self[voice]
 httpx
 python-dotenv
 google-genai
+PyNaCl
+davey

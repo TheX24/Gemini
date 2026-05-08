@@ -52,8 +52,7 @@ async def _call_ollama(messages: list, client: httpx.AsyncClient, model: str) ->
         if eval_duration_ns > 0:
             tps = eval_tokens / (eval_duration_ns / 1e9)
         
-        # Update database stats
-        increment_stats(tokens=prompt_tokens + eval_tokens)
+        # Update database stats (Centralized in bot.py now)
         
         return {
             "content": data.get("message", {}).get("content", ""),

@@ -16,32 +16,39 @@ PHRASES_QUEUE = config.PHRASES_QUEUE
 
 # Error Mapping for LLM Responses
 LLM_ERROR_MAPPING = {
-    400: ("Invalid Argument", "Double check your request, something seems invalid!"),
-    401: ("Unauthenticated", "Authentication failed. My API key might be invalid."),
-    403: ("Permission Denied", "Permission denied. I don't have access to this resource."),
-    404: ("Not Found", "Model not found. It might be deprecated or non-existent."),
-    429: ("Resource Exhausted", "I'm a bit overwhelmed right now, please try again in a minute!"),
-    500: ("Internal Error", "Internal server error. Google's AI is having a moment."),
-    503: ("Service Unavailable", "Service unavailable. The AI is likely down or overloaded."),
-    504: ("Gateway Timeout", "Gateway timeout. The request took way too long."),
+    400: ("Invalid Argument", "Something went a bit sideways with that request! I'm having trouble processing the details as they were sent."),
+    401: ("Unauthenticated", "I'm having trouble logging in to my AI brain. It looks like my API key is missing or invalid. Please alert my owner!"),
+    403: ("Permission Denied", "I'm not allowed to do that! It seems I don't have the right permissions to access this specific resource."),
+    404: ("Not Found", "I can't find the model I'm supposed to use. It might have been retired or moved. I should probably check my settings!"),
+    408: ("Request Timeout", "The request took too long and timed out. My connection might be a bit unstable right now."),
+    429: ("Resource Exhausted", "I'm a bit overwhelmed right now! I've hit my rate limit or the servers are too busy. Please give me a minute to breathe and try again."),
+    500: ("Internal Error", "Oops! Something went wrong on the AI's side. Google's servers are having a bit of a hiccup. Let's try again in a moment."),
+    502: ("Bad Gateway", "I'm having trouble communicating with the AI servers. There's a bit of a bridge out on the information superhighway!"),
+    503: ("Service Unavailable", "The AI service is currently down for maintenance or is heavily overloaded. It's not you, it's them! Check back shortly."),
+    504: ("Gateway Timeout", "The AI took too long to respond. It's likely stuck on a very complex thought. Try a simpler prompt or wait a bit."),
 }
 
 from context_builder import clean_mention, build_context
-from llm_client import ask_llm
-from gemini_client import get_client
+from llm_client import ask_llm, extract_error_code
+from gemini_client import get_client, types
 
 from guardrails import is_safe_prompt
 from database import (
     init_db, add_reminder, get_due_reminders, delete_reminder, save_memory, 
     get_memories, increment_stats, get_stats, save_user_variation, 
     get_user_settings, get_message_variation, save_message_variation,
-    save_system_state, get_system_state, save_keyword_memory, get_keyword_memories
+    get_channel_settings, save_channel_variation, get_server_settings,
+    save_server_variation,
+    save_system_state, get_system_state, save_keyword_memory, get_keyword_memories,
+    add_to_whitelist, remove_from_whitelist, is_whitelisted, toggle_whitelist,
+    get_budget_spent, add_to_budget_spent
 )
 import time
 import urllib.parse
 import json
 import re
 import os
+import io
 
 # ---------------------------------------------------------------------------
 # File attachment security policy
@@ -193,13 +200,14 @@ async def status_loop(bot: discord.Client):
     """
     Background task to continuously update the bot's Rich Presence with global stats.
     """
-    await bot.wait_until_ready()
     while not bot.is_closed():
         try:
+            await bot.wait_until_ready()
+            
             stats = get_stats()
             servers = len(bot.guilds)
-            msgs = stats['messages_answered']
-            tokens = stats['tokens_used']
+            msgs = stats.get('messages_answered', 0) or 0
+            tokens = stats.get('tokens_used', 0) or 0
             
             # Format nicely, e.g., 25.5k, 1.25M
             if tokens >= 1_000_000:
@@ -232,11 +240,25 @@ async def status_loop(bot: discord.Client):
                     "afk": False
                 }
             }
-            await bot.ws.send_as_json(payload)
+            
+            # Safely check for websocket before sending
+            ws = getattr(bot, 'ws', None)
+            if ws and hasattr(ws, 'send_as_json'):
+                try:
+                    await ws.send_as_json(payload)
+                except Exception as ws_err:
+                    # Specific workaround for 'closed' attribute error in some library versions
+                    if "'closed'" in str(ws_err):
+                        await ws.send(json.dumps(payload))
+                    else:
+                        raise ws_err
+            else:
+                logger.warning("Websocket not available for rich presence update.")
         except Exception as e:
             logger.error(f"Failed to update rich presence: {e}")
         
-        await asyncio.sleep(60)
+        # Run every 5 minutes (300s) to reduce gateway noise
+        await asyncio.sleep(300)
         
 class PromptQueue:
     def __init__(self, bot):
@@ -527,6 +549,8 @@ class GeminiSelfBot(discord.Client):
         self.start_time = int(time.time() * 1000)
         self.prompt_queue = PromptQueue(self)
         self.reminder_loop_started = False
+        self.vc_join_time = None
+        self.vc_connect_lock = asyncio.Lock()
 
 
     async def on_ready(self):
@@ -566,6 +590,184 @@ class GeminiSelfBot(discord.Client):
             self.loop.create_task(self.reminder_loop())
             self.reminder_loop_started = True
         self.prompt_queue.start()
+        # stay_alive_loop removed as it is redundant with status_loop and can cause instability
+        self.loop.create_task(self.vc_watchdog_loop())
+
+
+        # Rejoin voice channel if persisted
+        last_vc_id = get_system_state("last_vc_id")
+        if last_vc_id:
+            try:
+                # We wait a bit to ensure internal caches are warm
+                await asyncio.sleep(2)
+                chan = self.get_channel(int(last_vc_id)) or await self.fetch_channel(int(last_vc_id))
+                if chan and isinstance(chan, discord.VoiceChannel):
+                    # Check if already in this voice channel to avoid "Already connected" error
+                    existing_vc = discord.utils.get(self.voice_clients, guild=chan.guild)
+                    if not existing_vc:
+                        await chan.connect()
+                        logger.info(f"Rejoined persisted VC: {chan.name} ({chan.id})")
+                    else:
+                        logger.info(f"Already connected to VC in guild {chan.guild.id}. Skipping rejoin.")
+            except Exception as e:
+                logger.error(f"Failed to rejoin persisted VC {last_vc_id}: {e}")
+
+    async def on_connect(self):
+        logger.info("Bot has connected to the Discord Gateway.")
+
+    async def on_disconnect(self):
+        logger.warning("Bot has disconnected from the Discord Gateway.")
+
+    async def on_resumed(self):
+        logger.info("Bot has successfully resumed the session.")
+
+    async def on_voice_state_update(self, member, before, after):
+        """
+        Monitor voice state changes to log disconnections and attempt auto-reconnect if unexpected.
+        Includes logic to rejoin original VC if moved by a moderator.
+        """
+        if member.id == self.user.id:
+            last_vc_id = get_system_state("last_vc_id")
+            
+            # Case: Disconnected from a channel
+            if before.channel and not after.channel:
+                logger.info(f"Disconnected from voice channel: {before.channel.name} (ID: {before.channel.id})")
+                
+                # Check if this was an unexpected disconnect (i.e. last_vc_id is still set to this channel)
+                if last_vc_id == str(before.channel.id):
+                    logger.warning(f"Unexpectedly removed from VC {before.channel.id}. Attempting to reconnect in 10s...")
+                    await asyncio.sleep(10)
+                    
+                    # Retry logic for reconnection
+                    for attempt in range(3):
+                        try:
+                            # Re-fetch channel to ensure it still exists and we have access
+                            chan = self.get_channel(before.channel.id) or await self.fetch_channel(before.channel.id)
+                            if chan and isinstance(chan, discord.VoiceChannel):
+                                # Double check we aren't already connected (e.g. library auto-reconnected)
+                                async with self.vc_connect_lock:
+                                    if not member.guild.voice_client:
+                                        await chan.connect(timeout=15.0)
+                                        logger.info(f"Successfully auto-reconnected to VC: {chan.name} (Attempt {attempt+1})")
+                                        return
+                                    else:
+                                        logger.info(f"Already connected to VC: {chan.name}")
+                                        return
+                        except Exception as e:
+                            logger.error(f"Auto-reconnect attempt {attempt+1} failed: {e}")
+                            if attempt < 2:
+                                await asyncio.sleep(5)
+                    
+                    logger.error("All auto-reconnect attempts failed. Watchdog will handle future retries.")
+            
+            # Case: Switched channels (could be a server move)
+            elif before.channel and after.channel and before.channel.id != after.channel.id:
+                if last_vc_id and str(after.channel.id) != last_vc_id:
+                    logger.warning(f"Voice channel move detected (External): {before.channel.name} -> {after.channel.name}. Moving back to original VC...")
+                    try:
+                        orig_chan = self.get_channel(int(last_vc_id)) or await self.fetch_channel(int(last_vc_id))
+                        if orig_chan and isinstance(orig_chan, discord.VoiceChannel):
+                            # Short delay before moving back to avoid race conditions or being flagged
+                            await asyncio.sleep(2)
+                            await orig_chan.connect()
+                            logger.info(f"Successfully moved back to original VC: {orig_chan.name}")
+                        else:
+                            raise Exception("Original channel no longer accessible or not a voice channel.")
+                    except Exception as e:
+                        logger.error(f"Failed to move back to original VC: {e}")
+                        # If we can't move back, disconnect from the current channel and clear state
+                        if member.guild.voice_client:
+                            await member.guild.voice_client.disconnect()
+                        save_system_state("last_vc_id", None)
+                        save_system_state("vc_session_start", None)
+                        logger.info("Disconnected from voice and cleared last_vc_id due to move-back failure.")
+                else:
+                    logger.info(f"Voice channel move detected: {before.channel.name} -> {after.channel.name}")
+                    # Update state if it wasn't set yet (anchoring)
+                    if not last_vc_id:
+                        save_system_state("last_vc_id", str(after.channel.id))
+            
+            # Case: Joined a channel for the first time
+            elif not before.channel and after.channel:
+                logger.info(f"Joined voice channel: {after.channel.name} (ID: {after.channel.id})")
+                if not last_vc_id:
+                    save_system_state("last_vc_id", str(after.channel.id))
+                    logger.info(f"Anchored last_vc_id to {after.channel.name} ({after.channel.id})")
+
+
+    # stay_alive_loop was here (removed for stability)
+
+    async def vc_watchdog_loop(self):
+        """
+        Checks every 5 minutes if the bot should be in a VC and reconnects if dropped.
+        """
+        await self.wait_until_ready()
+        # Initial delay to let on_ready's rejoin logic finish first
+        await asyncio.sleep(30)
+        while not self.is_closed():
+            try:
+                last_vc_id = get_system_state("last_vc_id")
+                if last_vc_id:
+                    # Check if we are currently in any voice channel
+                    if not self.voice_clients:
+                        logger.warning(f"Voice Watchdog: Not in any VC but last_vc_id is {last_vc_id}. Reconnecting...")
+                        try:
+                            chan = self.get_channel(int(last_vc_id)) or await self.fetch_channel(int(last_vc_id))
+                            if chan and isinstance(chan, discord.VoiceChannel):
+                                async with self.vc_connect_lock:
+                                    if not self.voice_clients:
+                                        await chan.connect(timeout=15.0)
+                                        logger.info(f"Voice Watchdog: Successfully reconnected to {chan.name}")
+                                    else:
+                                        logger.info(f"Voice Watchdog: Already reconnected to {chan.name} by another process.")
+                            else:
+                                logger.error(f"Voice Watchdog: Channel {last_vc_id} not found or not a VC. Clearing state.")
+                                save_system_state("last_vc_id", None)
+                        except Exception as e:
+                            logger.error(f"Voice Watchdog: Reconnect failed with error: {e}. Will retry next cycle.")
+            except Exception as e:
+                logger.error(f"Error in vc_watchdog_loop: {e}")
+                
+            await asyncio.sleep(120) # 2 minutes (was 5m)
+
+
+    async def vc_status_auto_loop(self):
+        """
+        Periodically updates the VC status if an autostatus template is set.
+        """
+        await self.wait_until_ready()
+        last_reported_hour = -1
+        
+        while not self.is_closed():
+            try:
+                template = get_system_state("vc_autostatus_template")
+                session_start_str = get_system_state("vc_session_start")
+                
+                if template and self.voice_clients:
+                    # Use persistent start time if set, otherwise use bot's join time
+                    start_time = float(session_start_str) if session_start_str else self.vc_join_time
+                    
+                    if start_time:
+                        hours = int((time.time() - start_time) // 3600)
+                        
+                        if hours != last_reported_hour:
+                            status_msg = template.replace("{hours}", str(hours))
+                            
+                            for vc in self.voice_clients:
+                                try:
+                                    route = discord.http.Route('PUT', '/channels/{channel_id}/voice-status', channel_id=vc.channel.id)
+                                    await self.http.request(route, json={'status': status_msg})
+                                except:
+                                    pass
+                            
+                            last_reported_hour = hours
+                            logger.info(f"Auto-updated VC status to: {status_msg}")
+                else:
+                    last_reported_hour = -1
+            except Exception as e:
+                logger.error(f"Error in vc_status_auto_loop: {e}")
+                
+            await asyncio.sleep(60) # Check every minute
 
 
     async def reminder_loop(self):
@@ -624,42 +826,266 @@ class GeminiSelfBot(discord.Client):
                     save_system_state("pending_restart_message_id", str(init_msg.id))
                     subprocess.run(["pm2", "restart", "gemini-bot"])
                     return
+
+                elif sub == "kill":
+                    await message.reply("> 💀 **Terminating bot instance...**")
+                    # This will trigger the finally block in main.py to clean up the lock file
+                    await self.close()
+                    return
                     
                 elif sub == "model":
-                    if len(parts) < 3:
-                        await message.reply("> ❌ **Usage:** `;gem model <model_id>`")
+                    if len(parts) < 4:
+                        await message.reply("> ❌ **Usage:** `;gem model <type> <model_id>` (types: text, image, video, song)")
                         return
-                    new_model = parts[2].strip()
+                    m_type = parts[2].lower()
+                    new_model = parts[3].strip()
                     
-                    # Active Model Validation
-                    validate_msg = await message.reply(f"> 🔍 **Validating model:** `{new_model}`...")
+                    if m_type not in ("text", "image", "video", "song", "audio"):
+                        await message.reply("> ❌ **Unknown type:** Must be text, image, video, or song.")
+                        return
+
+                    validate_msg = await message.reply(f"> 🔍 **Validating {m_type} model:** `{new_model}`...")
                     try:
-                        genai_client = get_client()
+                        # Use correct region for validation
+                        v_loc = "global" if m_type == "text" else config.IMAGE_LOCATION if m_type == "image" else config.VIDEO_LOCATION if m_type == "video" else config.AUDIO_LOCATION
+                        genai_client = get_client(location=v_loc if config.USE_VERTEX_AI else None)
                         await genai_client.aio.models.get(model=new_model)
-                        config.update_config("GEMINI_MODEL", new_model)
-                        await validate_msg.edit(content=f"> ✅ **Model validated and changed to:** `{new_model}`")
+                        
+                        env_key = ""
+                        if m_type == "text": env_key = "GEMINI_MODEL"
+                        elif m_type == "image": env_key = "GEMINI_MODEL_IMAGE"
+                        elif m_type == "video": env_key = "GEMINI_MODEL_VIDEO"
+                        elif m_type in ("song", "audio"): env_key = "GEMINI_MODEL_AUDIO"
+                        
+                        config.update_config(env_key, new_model)
+                        await validate_msg.edit(content=f"> ✅ **{m_type.capitalize()} model validated and changed to:** `{new_model}`")
                     except Exception as e:
                         await validate_msg.edit(content=f"> ❌ **Invalid Model:** `{new_model}` is not accessible or does not exist.\n> *Error: {str(e)[:300]}*")
                     return
                     
-                elif sub == "autothink":
-                    if len(parts) < 3:
-                        await message.reply("> ❌ **Usage:** `;gem autothink <on/off>`")
+                elif sub == "config":
+                    if len(parts) < 4:
+                        if len(parts) == 3 and parts[2].lower() == "queue":
+                            await message.reply(f"> ⏳ **Queue Status:** `{'Enabled' if config.ENABLE_QUEUE else 'Disabled'}`\n> **Usage:** `;gem config queue <on/off>`")
+                            return
+                        await message.reply("> ❌ **Usage:** `;gem config <key> <val>`\nKeys: `autothink`, `vertex`, `statusmsg`, `queue`, `budget`, `aspect`, `safety`, `people`, `image_res`, `video_res`, `fps`, `duration`, `audio_len`, `image_cost`, `video_cost`, `song_cost`")
                         return
-                    val = get_toggle_val(parts[2])
-                    config.update_config("AUTO_THINKING", val)
-                    await message.reply(f"> ✅ **Auto-Thinking set to:** `{val == 'true'}`")
+                        
+                    key = parts[2].lower()
+                    val = parts[3]
+                    is_on = get_toggle_val(val) == "true"
+                    
+                    if key == "autothink":
+                        config.update_config("AUTO_THINKING", "true" if is_on else "false")
+                        await message.reply(f"> ✅ **Auto-Thinking set to:** `{is_on}`")
+                    elif key == "vertex":
+                        config.update_config("USE_VERTEX_AI", "true" if is_on else "false")
+                        await message.reply(f"> ✅ **Vertex AI set to:** `{is_on}`")
+                    elif key == "statusmsg" or key == "loading":
+                        config.update_config("SHOW_LOADING_MESSAGES", "true" if is_on else "false")
+                        await message.reply(f"> ✅ **Status Messages set to:** `{is_on}`")
+                    elif key == "queue":
+                        config.update_config("ENABLE_QUEUE", "true" if is_on else "false")
+                        await message.reply(f"> ✅ **Queue System set to:** `{is_on}`")
+                    elif key == "budget":
+                        try:
+                            val_float = float(val)
+                            config.update_config("DAILY_BUDGET", str(val_float))
+                            await message.reply(f"> ✅ **Daily Budget set to:** `{val_float} €`")
+                        except ValueError:
+                            await message.reply("> ❌ **Invalid number for budget.**")
+                    elif key in ("image_cost", "video_cost", "song_cost", "audio_cost"):
+                        try:
+                            val_float = float(val)
+                            target_key = key.upper()
+                            if target_key == "AUDIO_COST": target_key = "SONG_COST"
+                            config.update_config(target_key, str(val_float))
+                            await message.reply(f"> ✅ **{key.replace('_', ' ').capitalize()} set to:** `{val_float} €`")
+                        except ValueError:
+                            await message.reply(f"> ❌ **Invalid number for {key.replace('_', ' ')}.**")
+                    elif key == "aspect":
+                        config.update_config("ASPECT_RATIO", val)
+                        await message.reply(f"> ✅ **Aspect Ratio set to:** `{val}`")
+                    elif key == "safety":
+                        config.update_config("SAFETY_FILTER_LEVEL", val)
+                        await message.reply(f"> ✅ **Safety Filter set to:** `{val}`")
+                    elif key == "people":
+                        config.update_config("PERSON_GENERATION", val)
+                        await message.reply(f"> ✅ **Person Generation set to:** `{val}`")
+                    elif key == "fps":
+                        config.update_config("VIDEO_FPS", val)
+                        await message.reply(f"> ✅ **Video FPS set to:** `{val}`")
+                    elif key == "duration":
+                        config.update_config("VIDEO_DURATION", val)
+                        await message.reply(f"> ✅ **Video Duration set to:** `{val}s`")
+                    elif key == "video_res":
+                        config.update_config("VIDEO_RES", val)
+                        await message.reply(f"> ✅ **Video Resolution set to:** `{val}`")
+                    elif key == "image_res":
+                        config.update_config("IMAGE_RES", val)
+                        await message.reply(f"> ✅ **Image Resolution set to:** `{val}`")
+                    elif key == "audio_len":
+                        config.update_config("AUDIO_DURATION", val)
+                        await message.reply(f"> ✅ **Audio Max Length set to:** `{val}s`")
+                    else:
+                        await message.reply("> ❌ **Unknown config key.**")
                     return
                     
-                elif sub == "vertex":
+                elif sub == "whitelist":
                     if len(parts) < 3:
-                        await message.reply("> ❌ **Usage:** `;gem vertex <on/off>`")
+                        await message.reply("> ❌ **Usage:** `;gem whitelist <user_id>`")
                         return
-                    is_on = parts[2].lower() in ("on", "true", "yes")
-                    config.update_config("USE_VERTEX_AI", "true" if is_on else "false")
-                    await message.reply(f"> ✅ **Vertex AI set to:** `{is_on}`")
+                    try:
+                        uid = int(parts[2].strip("<@!>"))
+                        new_status = toggle_whitelist(uid)
+                        await message.reply(f"> ✅ **User {uid} whitelist status:** `{'Enabled' if new_status else 'Disabled'}`")
+                    except ValueError:
+                        await message.reply("> ❌ **Invalid user ID.**")
                     return
                     
+                elif sub == "budget":
+                    spent = get_budget_spent()
+                    remaining = max(0.0, config.DAILY_BUDGET - spent)
+                    await message.reply(
+                        f"> 💳 **Daily Budget Status**\n"
+                        f"- **Limit:** `{config.DAILY_BUDGET} €`\n"
+                        f"- **Spent:** `{spent:.4f} €`\n"
+                        f"- **Remaining:** `{remaining:.4f} €`"
+                    )
+                    return
+
+                elif sub == "vc":
+                    if len(parts) < 3:
+                        await message.reply("> ❌ **Usage:** `;gem vc <channel_id_or_tag>` or `;gem vc leave`")
+                        return
+                    
+                    cmd = parts[2].lower()
+                    if cmd == "leave":
+                        if self.voice_clients:
+                            save_system_state("last_vc_id", None)
+                            save_system_state("vc_session_start", None)
+                            count = len(self.voice_clients)
+                            for vc in list(self.voice_clients):
+                                await vc.disconnect()
+                            await message.reply(f"> 👋 **Left {count} Voice Channel(s).**")
+                        else:
+                            await message.reply("> ❌ **Not currently in any voice channel.**")
+                        return
+
+                    elif cmd == "status":
+                        if len(parts) < 4:
+                            await message.reply("> ❌ **Usage:** `;gem vc status <message>`")
+                            return
+                        
+                        status_msg = " ".join(parts[3:])
+                        last_vc_id = get_system_state("last_vc_id")
+                        target_vc = None
+                        
+                        if last_vc_id:
+                            for vc in self.voice_clients:
+                                if str(vc.channel.id) == last_vc_id:
+                                    target_vc = vc
+                                    break
+                        
+                        if not target_vc and self.voice_clients:
+                            target_vc = self.voice_clients[0]
+                            
+                        if target_vc:
+                            try:
+                                # Update Voice Channel Status (Self-bot feature)
+                                route = discord.http.Route('PUT', '/channels/{channel_id}/voice-status', channel_id=target_vc.channel.id)
+                                await self.http.request(route, json={'status': status_msg})
+                                await message.reply(f"> ✅ **VC Status set to:** `{status_msg}`")
+                            except Exception as e:
+                                await message.reply(f"> ❌ **Failed to set VC status:** `{str(e)}`")
+                        else:
+                            await message.reply("> ❌ **Not currently in a voice channel.**")
+                        return
+
+                    elif cmd == "autostatus":
+                        if len(parts) < 3:
+                            await message.reply("> ❌ **Usage:** `;gem vc autostatus <template> [--uptime HH:MM:SS]` or `;gem vc autostatus off`")
+                            return
+                        
+                        full_val = " ".join(parts[3:]).strip()
+                        if full_val.lower() in ("off", "none", "disable"):
+                            save_system_state("vc_autostatus_template", None)
+                            save_system_state("vc_session_start", None)
+                            await message.reply("> ❌ **VC Auto-Status disabled.**")
+                        else:
+                            # Parse optional flags
+                            template = full_val
+                            manual_uptime_seconds = 0
+                            
+                            # 1. Handle --uptime HH:MM:SS
+                            if "--uptime" in full_val:
+                                t_parts = full_val.split("--uptime")
+                                template = t_parts[0].strip()
+                                uptime_str = t_parts[1].strip().split()[0]
+                                try:
+                                    up_parts = uptime_str.split(':')
+                                    if len(up_parts) == 3: # HH:MM:SS
+                                        manual_uptime_seconds = int(up_parts[0])*3600 + int(up_parts[1])*60 + int(up_parts[2])
+                                    elif len(up_parts) == 2: # MM:SS
+                                        manual_uptime_seconds = int(up_parts[0])*60 + int(up_parts[1])
+                                    
+                                    if manual_uptime_seconds > 0:
+                                        session_start = time.time() - manual_uptime_seconds
+                                        save_system_state("vc_session_start", str(session_start))
+                                except:
+                                    await message.reply("> ⚠️ **Invalid uptime format.** Use `HH:MM:SS`. Ignoring flag.")
+                            
+                            # 2. Handle --start <timestamp>
+                            elif "--start" in full_val:
+                                t_parts = full_val.split("--start")
+                                template = t_parts[0].strip()
+                                start_str = t_parts[1].strip().split()[0]
+                                try:
+                                    start_ts = float(start_str)
+                                    # Detect milliseconds (timestamps > year 3000 in seconds are likely ms)
+                                    if start_ts > 32503680000: 
+                                        start_ts /= 1000
+                                    save_system_state("vc_session_start", str(start_ts))
+                                    manual_uptime_seconds = -1 # Flag that we used a timestamp
+                                except:
+                                    await message.reply("> ⚠️ **Invalid start timestamp.** Ignoring flag.")
+                            
+                            if "{hours}" not in template:
+                                await message.reply("> ⚠️ **Warning:** Your template doesn't contain `{hours}`. It will be a static message.")
+                            
+                            save_system_state("vc_autostatus_template", template)
+                            if not self.vc_join_time and self.voice_clients:
+                                self.vc_join_time = time.time()
+                                
+                            reply_msg = f"> ✅ **VC Auto-Status set to:** `{template}`"
+                            if manual_uptime_seconds > 0:
+                                reply_msg += f"\n> 🕒 **Synced with current uptime:** `{uptime_str}`"
+                            elif manual_uptime_seconds == -1:
+                                reply_msg += f"\n> 🕒 **Synced with start timestamp:** `{start_str}`"
+                            await message.reply(reply_msg)
+                        return
+
+                    chan_str = cmd.strip("<#>")
+                    try:
+                        chan_id = int(chan_str)
+                        vc_chan = self.get_channel(chan_id) or await self.fetch_channel(chan_id)
+                        if vc_chan and isinstance(vc_chan, discord.VoiceChannel):
+                            # Move behavior: disconnect from existing VCs first
+                            if self.voice_clients:
+                                for vc in list(self.voice_clients):
+                                    # Only disconnect if it's a different guild; connect() handles same-guild moves better
+                                    if vc.guild.id != vc_chan.guild.id:
+                                        await vc.disconnect()
+                            
+                            save_system_state("last_vc_id", str(chan_id))
+                            await vc_chan.connect()
+                            await message.reply(f"> ✅ **Joined VC:** `{vc_chan.name}`")
+                        else:
+                            await message.reply("> ❌ **Channel not found or not a voice channel.**")
+                    except Exception as e:
+                        await message.reply(f"> ❌ **Error:** {str(e)}")
+                    return
+
                 elif sub == "pause":
                     config.update_config("IS_PAUSED", "true")
                     await message.reply("> ⏸️ **Bot Paused.**")
@@ -668,26 +1094,6 @@ class GeminiSelfBot(discord.Client):
                 elif sub == "resume":
                     config.update_config("IS_PAUSED", "false")
                     await message.reply("> ▶️ **Bot Resumed.**")
-                    return
-                    
-                elif sub == "statusmsg" or sub == "loading":
-                    if len(parts) < 3:
-                        await message.reply("> ❌ **Usage:** `;gem statusmsg <on/off>`")
-                        return
-                    val = get_toggle_val(parts[2])
-                    config.update_config("SHOW_LOADING_MESSAGES", val)
-                    await message.reply(f"> ✅ **Status Messages set to:** `{val == 'true'}`")
-                    return
-                    
-
-
-                elif sub == "queue":
-                    if len(parts) < 3:
-                        await message.reply(f"> ⏳ **Queue Status:** `{'Enabled' if config.ENABLE_QUEUE else 'Disabled'}`\n> **Usage:** `;gem queue <on/off>`")
-                        return
-                    val = get_toggle_val(parts[2])
-                    config.update_config("ENABLE_QUEUE", val)
-                    await message.reply(f"> ✅ **Queue System set to:** `{val == 'true'}`")
                     return
 
                 elif sub == "join":
@@ -708,14 +1114,20 @@ class GeminiSelfBot(discord.Client):
                     # Full admin help for the owner
                     help_text = (
                         "> 🛠️ **Admin Commands**\n"
-                        "- `;gem model <id>`: Switch Gemini model.\n"
-                        "- `;gem autothink <on/off>`: Toggle native reasoning.\n"
-                        "- `;gem statusmsg <on/off>`: Toggle loading messages.\n"
-                        "- `;gem vertex <on/off>`: Toggle Vertex AI mode.\n"
-                        "- `;gem queue <on/off>`: Toggle prompt queue.\n"
+                        "- `;gem config <key> <val>`: Set config (autothink, vertex, statusmsg, queue, budget, aspect, safety, people, image_res, video_res, fps, duration, audio_len, image_cost, video_cost, song_cost).\n"
+                        "- `;gem model <type> <id>`: Switch model (text, image, video, song).\n"
+                        "- `;gem whitelist <id>`: Toggle user access to media commands.\n"
+                        "- `;gem budget`: Show daily spending and limits.\n"
+                        "- `;gem vc <id>`: Join a voice channel.\n"
+                        "- `;gem vc leave`: Leave all voice channels.\n"
+                        "- `;gem vc status <text>`: Set current VC status message.\n"
                         "- `;gem pause/resume`: Control bot processing.\n"
                         "- `;gem join <invite>`: Join a Discord server.\n"
                         "- `;gem restart`: Force PM2 process restart.\n\n"
+                        "> 🎨 **Media Commands** (Privileged)\n"
+                        "- `;gem image <prompt> [--stats]`: Generate an image.\n"
+                        "- `;gem video <prompt> [--stats]`: Generate a video.\n"
+                        "- `;gem song <prompt> [--stats]`: Generate a song/audio.\n\n"
                         "> 🎭 **Persona Commands**\n"
                         "- `;gem prompt <name> [user]`: Switch user personality.\n"
                         "- `;gem prompts`: List all variations with descriptions.\n"
@@ -776,16 +1188,174 @@ class GeminiSelfBot(discord.Client):
             parts = message.content.split()
             sub = parts[1].lower() if len(parts) > 1 else "help"
             
-            if sub == "prompts" or (sub == "prompt" and len(parts) < 3):
-                settings = get_user_settings(message.author.id)
-                current_var = settings.get('variation', 'default')
+            if sub in ("image", "video", "song"):
+                is_owner = message.author.id == 504541573636161546
+                is_self_admin = (message.author.id == self.user.id and message.guild and message.guild.id == 1490733173246660658)
+                whitelisted = is_whitelisted(message.author.id)
+                
+                if not (is_owner or is_self_admin or whitelisted):
+                    await message.reply("> ❌ **Unauthorized:** You are not on the whitelist to use media generation commands.")
+                    return
+                
+                # Budget Check (Owner Exception)
+                spent = get_budget_spent()
+                if spent >= config.DAILY_BUDGET and not (is_owner or is_self_admin):
+                    await message.reply(f"> ❌ **Budget Exhausted:** The daily media generation budget ({config.DAILY_BUDGET} €) has been reached. Only the owner can use these commands now.")
+                    return
+
+                show_gen_stats = "--stats" in message.content.lower()
+                prompt = " ".join(parts[2:]).replace("--stats", "").strip()
+                
+                if not prompt:
+                    await message.reply(f"> ❌ **Usage:** `;gem {sub} <prompt> [--stats]`")
+                    return
+                    
+                model_name = ""
+                cost = 0.0
+                if sub == "image":
+                    model_name = config.GEMINI_MODEL_IMAGE
+                    cost = config.IMAGE_COST
+                elif sub == "video":
+                    model_name = config.GEMINI_MODEL_VIDEO
+                    cost = config.VIDEO_COST
+                elif sub == "song":
+                    model_name = config.GEMINI_MODEL_AUDIO
+                    cost = config.SONG_COST
+                    
+                loading_msg = await message.reply(f"> ⏳ ***Generating {sub} using {model_name}...***")
+                try:
+                    # For media generation in Vertex AI, we use the specific region (Lyria needs us-east5)
+                    loc = config.IMAGE_LOCATION if sub == "image" else config.VIDEO_LOCATION if sub == "video" else config.AUDIO_LOCATION
+                    genai_client = get_client(location=loc if config.USE_VERTEX_AI else None)
+                    media_bytes = None
+                    filename = ""
+                    
+                    start_gen = time.time()
+                    if sub == "image":
+                        if "gemini" in model_name.lower():
+                            # Gemini multimodal image generation
+                            # Map 1080p to 1K for imageSize
+                            size_map = {"1080p": "1K", "4k": "4K", "2k": "2K", "720p": "0.5K"}
+                            mapped_size = size_map.get(config.IMAGE_RES.lower(), "1K")
+                            
+                            res = await genai_client.aio.models.generate_content(
+                                model=model_name,
+                                contents=prompt,
+                                config=types.GenerateContentConfig(
+                                    response_modalities=["IMAGE"],
+                                    image_config=types.ImageConfig(
+                                        aspect_ratio=config.ASPECT_RATIO,
+                                        image_size=mapped_size
+                                    )
+                                )
+                            )
+                            if res.candidates and res.candidates[0].content.parts:
+                                for part in res.candidates[0].content.parts:
+                                    if part.inline_data and part.inline_data.data:
+                                        media_bytes = part.inline_data.data
+                                        break
+                        else:
+                            # Standard Imagen generation
+                            res = await genai_client.aio.models.generate_images(
+                                model=model_name, 
+                                prompt=prompt,
+                                config=types.GenerateImagesConfig(
+                                    aspect_ratio=config.ASPECT_RATIO,
+                                    safety_filter_level=config.SAFETY_FILTER_LEVEL,
+                                    person_generation=config.PERSON_GENERATION
+                                )
+                            )
+                            if res.generated_images:
+                                media_bytes = res.generated_images[0].image.image_bytes
+                        
+                        if media_bytes:
+                            filename = f"generated_image_{int(time.time())}.png"
+                    elif sub == "video":
+                        res = await genai_client.aio.models.generate_videos(
+                            model=model_name, 
+                            prompt=prompt,
+                            config=types.GenerateVideosConfig(
+                                fps=config.VIDEO_FPS,
+                                duration_seconds=config.VIDEO_DURATION,
+                                aspect_ratio=config.ASPECT_RATIO,
+                                resolution=config.VIDEO_RES
+                            )
+                        )
+                        if res.generated_videos:
+                            media_bytes = res.generated_videos[0].video.video_bytes
+                            filename = f"generated_video_{int(time.time())}.mp4"
+                    elif sub == "song":
+                        # Lyria models often have specific requirements or fixed lengths
+                        is_clip = "clip" in model_name.lower()
+                        duration = 30 if is_clip else config.AUDIO_DURATION
+                        audio_prompt = f"{prompt} (Length: {duration}s)"
+                        
+                        res = await genai_client.aio.models.generate_content(
+                            model=model_name,
+                            contents=prompt,
+                            config=types.GenerateContentConfig(
+                                response_modalities=['AUDIO'],
+                                candidate_count=1
+                            )
+                        )
+                        for part in res.candidates[0].content.parts:
+                            if part.inline_data and part.inline_data.data:
+                                media_bytes = part.inline_data.data
+                                ext = "wav"
+                                if part.inline_data.mime_type and "mp3" in part.inline_data.mime_type:
+                                    ext = "mp3"
+                                filename = f"generated_audio_{int(time.time())}.{ext}"
+                                break
+                    gen_time = time.time() - start_gen
+
+                    if media_bytes:
+                        add_to_budget_spent(cost)
+                        new_spent = get_budget_spent()
+                        remaining = max(0.0, config.DAILY_BUDGET - new_spent)
+                        
+                        footer = f"> 💳 **Cost:** `{cost} €` | **Remaining:** `{remaining:.4f} €`"
+                        if show_gen_stats:
+                            footer += f"\n> ⏱️ **Time:** `{gen_time:.2f}s` | **Model:** `{model_name}`"
+                            
+                        file_attachment = discord.File(io.BytesIO(media_bytes), filename=filename)
+                        await message.reply(content=footer, file=file_attachment)
+                        await loading_msg.delete()
+                    else:
+                        await loading_msg.edit(content=f"> ❌ **Failed:** No {sub} data returned by the model.")
+                except Exception as e:
+                    logger.error(f"Media generation error: {e}")
+                    err_code = extract_error_code(e)
+                    status_str, friendly_msg = LLM_ERROR_MAPPING.get(err_code, ("Unknown Error", f"Oops! I encountered an unexpected error while generating {sub}."))
+                    
+                    await loading_msg.edit(content=f"> ❌ **{status_str}:** {friendly_msg}\n> *Error code: {err_code}*")
+                return
+
+            elif sub == "prompts" or (sub == "prompt" and len(parts) < 3):
+                # Context-aware active variation
+                user_var = get_user_settings(message.author.id).get('variation', 'default')
+                chan_var = get_channel_settings(message.channel.id).get('variation', 'default') if message.channel else 'default'
+                guild_var = get_server_settings(message.guild.id).get('variation', 'default') if message.guild else 'default'
+                
+                active_var = 'default'
+                if user_var != 'default': active_var = user_var
+                elif chan_var != 'default': active_var = chan_var
+                elif guild_var != 'default': active_var = guild_var
                 
                 desc_lines = []
                 for k, v in config.PROMPT_DESCRIPTIONS.items():
-                    active_marker = " 🟢" if k == current_var else ""
-                    desc_lines.append(f"- **{k.capitalize()}**: {v}{active_marker}")
+                    markers = []
+                    if k == user_var: markers.append("👤")
+                    if k == chan_var and chan_var != 'default': markers.append("💬")
+                    if k == guild_var and guild_var != 'default': markers.append("🌐")
+                    
+                    marker_str = f" {' '.join(markers)}" if markers else ""
+                    if k == active_var: marker_str += " 🟢"
+                    
+                    desc_lines.append(f"- **{k.capitalize()}**: {v}{marker_str}")
                 
-                final_msg = "> 📜 **Available Prompt Variations**\n\n" + "\n".join(desc_lines) + "\n\n> **Usage:** `;gem prompt <name>`"
+                final_msg = "> 📜 **Available Prompt Variations**\n"
+                final_msg += f"> Legend: 👤 User | 💬 Channel | 🌐 Server | 🟢 Active\n\n"
+                final_msg += "\n".join(desc_lines) + "\n\n> **Usage:** `;gem prompt [channel|server] <name>`"
                 
                 if len(final_msg) > 1950:
                     parts_msg = [final_msg[i:i+1900] for i in range(0, len(final_msg), 1900)]
@@ -797,42 +1367,93 @@ class GeminiSelfBot(discord.Client):
                 if len(parts) < 3:
                     await message.reply("> ❌ **Missing variation name.** Use `;gem prompts` to see the list.")
                     return
-                    
-                target = parts[2].lower()
-                if target in config.PROMPT_MODIFIERS:
-                    target_user = message.author
+                
+                level = "user"
+                variation_name = parts[2].lower()
+                
+                if variation_name == "channel":
+                    level = "channel"
+                    if len(parts) < 4:
+                        await message.reply("> ❌ **Usage:** `;gem prompt channel <name>`")
+                        return
+                    variation_name = parts[3].lower()
+                elif variation_name == "server" or variation_name == "guild":
+                    level = "server"
+                    if len(parts) < 4:
+                        await message.reply("> ❌ **Usage:** `;gem prompt server <name>`")
+                        return
+                    variation_name = parts[3].lower()
+
+                if variation_name in config.PROMPT_MODIFIERS:
                     is_owner = message.author.id == 504541573636161546
+                    is_self_admin = (message.author.id == self.user.id and message.guild and message.guild.id == 1490733173246660658)
+                    is_admin = False
+                    if message.guild:
+                        perms = message.author.guild_permissions
+                        if level == "channel":
+                            is_admin = perms.manage_channels or perms.administrator
+                        elif level == "server":
+                            is_admin = perms.manage_guild or perms.administrator
                     
-                    if len(parts) > 3 and is_owner:
-                        try:
-                            # Mentions format is <@id> or <@!id>
-                            user_str = parts[3].strip('<@!>')
-                            if not user_str.isdigit():
-                                raise ValueError()
-                            target_user_id = int(user_str)
-                            target_user = self.get_user(target_user_id) or await self.fetch_user(target_user_id)
-                        except Exception:
-                            await message.reply("> ❌ **Invalid user ID or mention.**")
+                    can_manage = is_owner or is_self_admin or is_admin
+
+                    if level == "user":
+                        target_user = message.author
+                        if len(parts) > 3 and is_owner:
+                            try:
+                                # Mentions format is <@id> or <@!id>
+                                user_str = parts[3].strip('<@!>')
+                                if not user_str.isdigit():
+                                    raise ValueError()
+                                target_user_id = int(user_str)
+                                target_user = self.get_user(target_user_id) or await self.fetch_user(target_user_id)
+                            except Exception:
+                                await message.reply("> ❌ **Invalid user ID or mention.**")
+                                return
+                                
+                        save_user_variation(target_user.id, variation_name)
+                        if target_user.id == message.author.id:
+                            await message.reply(f"> ✅ **User personality shifted to:** `{variation_name.capitalize()}`")
+                        else:
+                            await message.reply(f"> ✅ **Personality for {target_user.name} shifted to:** `{variation_name.capitalize()}`")
+                    
+                    elif level == "channel":
+                        if not can_manage:
+                            await message.reply("> ❌ **Permission Denied:** You need `Manage Channels` permission.")
                             return
-                            
-                    save_user_variation(target_user.id, target)
-                    if target_user.id == message.author.id:
-                        await message.reply(f"> ✅ **Personality shifted to:** `{target.capitalize()}`")
-                    else:
-                        await message.reply(f"> ✅ **Personality for {target_user.name} shifted to:** `{target.capitalize()}`")
+                        save_channel_variation(message.channel.id, variation_name)
+                        await message.reply(f"> ✅ **Channel personality shifted to:** `{variation_name.capitalize()}`")
+                        
+                    elif level == "server":
+                        if not can_manage:
+                            await message.reply("> ❌ **Permission Denied:** You need `Manage Server` permission.")
+                            return
+                        save_server_variation(message.guild.id, variation_name)
+                        await message.reply(f"> ✅ **Server personality shifted to:** `{variation_name.capitalize()}`")
                 else:
-                    await message.reply(f"> ❌ **Unknown variation:** `{target}`. Use `;gem prompts` to see the list.")
+                    await message.reply(f"> ❌ **Unknown variation:** `{variation_name}`. Use `;gem prompts` to see the list.")
                 return
 
             elif sub == "help" and message.author.id != 504541573636161546:
                 # Public restricted help
-                help_text = (
-                    "> 🎭 **Gemini Persona Commands**\n"
-                    "- `;gem prompt <name>`: Switch the bot's personality for yourself.\n"
-                    "- `;gem prompts`: List all available personalities.\n"
-                    "- `;gem status`: Show current personality and system status.\n"
-                    "- `;gem help`: Show this message."
-                )
+                is_whitelisted_user = is_whitelisted(message.author.id)
+                
+                help_text = "> 🎭 **Gemini Persona Commands**\n"
+                help_text += "- `;gem prompt <name>`: Switch style for yourself.\n"
+                help_text += "- `;gem prompt channel <name>`: Switch style for this channel.\n"
+                help_text += "- `;gem prompt server <name>`: Switch style for this server.\n"
+                help_text += "- `;gem prompts`: List all available personalities.\n"
+                help_text += "- `;gem status`: Show current personality and system status.\n"
+                
+                if is_whitelisted_user:
+                    help_text += (
+                        "\n> 🎨 **Media Commands** (Whitelisted)\n"
+                        "- `;gem image <prompt> [--stats]`: Generate an image.\n"
+                        "- `;gem video <prompt> [--stats]`: Generate a video.\n"
+                        "- `;gem song <prompt> [--stats]`: Generate a song/audio.\n"
+                    )
+                
+                help_text += "- `;gem help`: Show this message."
                 await message.reply(help_text)
                 return
 
@@ -842,14 +1463,23 @@ class GeminiSelfBot(discord.Client):
                 think_status = "🧠 ON" if config.AUTO_THINKING else "⚪ OFF"
                 queue_status = "⏳ ON" if config.ENABLE_QUEUE else "⚪ OFF"
                 
-                # Fetch user-specific settings
-                user_settings = get_user_settings(message.author.id)
-                variation = user_settings.get('variation', 'default').capitalize()
+                # Fetch settings for all levels
+                user_var = get_user_settings(message.author.id).get('variation', 'default')
+                chan_var = get_channel_settings(message.channel.id).get('variation', 'default') if message.channel else 'default'
+                guild_var = get_server_settings(message.guild.id).get('variation', 'default') if message.guild else 'default'
+                
+                active_var = 'default'
+                if user_var != 'default': active_var = user_var
+                elif chan_var != 'default': active_var = chan_var
+                elif guild_var != 'default': active_var = guild_var
                 
                 await message.reply(
                     f"> 📊 **System Status**\n"
                     f"- **Model:** `{config.GEMINI_MODEL}`\n"
-                    f"- **Variation:** `{variation}`\n"
+                    f"- **Active Style:** `{active_var.capitalize()}` 🟢\n"
+                    f"- **User Style:** `{user_var.capitalize()}`\n"
+                    f"- **Channel Style:** `{chan_var.capitalize()}`\n"
+                    f"- **Server Style:** `{guild_var.capitalize()}`\n"
                     f"- **Mode:** `{mode}`\n"
                     f"- **Thinking:** `{think_status}`\n"
                     f"- **Queue:** `{queue_status}`\n"
@@ -1088,16 +1718,25 @@ class GeminiSelfBot(discord.Client):
             # 3. Build final prompt structures
             user_info_for_context = user_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
             other_for_context = other_users_info if not getattr(self, "ANONYMOUS_PROMPT", False) else None
+            # Fetch current context variation (Priority: Reply Chain > User > Channel > Server)
+            user_var = get_user_settings(message.author.id).get('variation', 'default')
+            chan_var = get_channel_settings(message.channel.id).get('variation', 'default') if message.channel else 'default'
+            guild_var = get_server_settings(message.guild.id).get('variation', 'default') if message.guild else 'default'
             
-            # Fetch current user personality
-            settings = get_user_settings(message.author.id)
-            variation = settings.get('variation', 'default')
+            variation = 'default'
+            if user_var != 'default':
+                variation = user_var
+            elif chan_var != 'default':
+                variation = chan_var
+            elif guild_var != 'default':
+                variation = guild_var
             
-            # Override with reply chain context if replying to the bot
+            # Override with reply chain context if replying to the bot (Highest priority for consistency)
             if is_reply_to_self and message.reference and message.reference.message_id:
                 chained_variation = get_message_variation(message.reference.message_id)
                 if chained_variation:
                     variation = chained_variation
+            
         
             messages = build_context(user_prompt, reply_content, is_reply_to_self, history=short_history, recap=recap, user_info=user_info_for_context, other_users_info=other_for_context, bot_username=str(self.user), media_data=media_data, variation=variation)
 
@@ -1201,6 +1840,7 @@ class GeminiSelfBot(discord.Client):
                             used_model=llm_res.get("model", ""),
                             variation=variation
                         )
+                        increment_stats(tokens=session_tokens)
                         return
                     
                     # 2. Silence Directive: [NO_RESPONSE]
@@ -1275,7 +1915,7 @@ class GeminiSelfBot(discord.Client):
                         used_model=llm_res.get("model", ""),
                         variation=variation
                     )
-                    increment_stats(messages=1)
+                    increment_stats(messages=1, tokens=session_tokens)
                     return
 
                 except Exception as e:

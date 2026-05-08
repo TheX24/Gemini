@@ -16,6 +16,12 @@ def update_config(key: str, value: str):
     # Special handling for boolean-like toggles
     if key in ("USE_VERTEX_AI", "IS_PAUSED", "AUTO_THINKING", "SHOW_LOADING_MESSAGES", "ENABLE_QUEUE"):
         globals()[key] = str(value).lower() in ("true", "1", "yes")
+    elif key in ("IMAGE_COST", "VIDEO_COST", "SONG_COST", "DAILY_BUDGET"):
+        globals()[key] = float(value)
+    elif key in ("ASPECT_RATIO", "SAFETY_FILTER_LEVEL", "PERSON_GENERATION", "VIDEO_RES"):
+        globals()[key] = str(value)
+    elif key in ("VIDEO_FPS", "VIDEO_DURATION", "AUDIO_DURATION"):
+        globals()[key] = int(value)
 
     # 2. Persist to .env file
     env_path = pathlib.Path(__file__).parent / ".env"
@@ -24,7 +30,7 @@ def update_config(key: str, value: str):
         # Regex to find the key and replace its value
         # Handles cases like KEY=VALUE or KEY="VALUE"
         pattern = rf'^({key}=).*'
-        new_line = f'\\1{value}'
+        new_line = f'\\g<1>{value}'
         
         # Check if the key exists, if so replace, otherwise append
         if re.search(rf'^{key}=', content, re.M):
@@ -47,9 +53,28 @@ OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 # Gemini Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL_IMAGE = os.getenv("GEMINI_MODEL_IMAGE", "imagen-3.0-generate-002")
+GEMINI_MODEL_VIDEO = os.getenv("GEMINI_MODEL_VIDEO", "veo-2.0-generate-001")
+GEMINI_MODEL_AUDIO = os.getenv("GEMINI_MODEL_AUDIO", "gemini-2.5-flash")
+IMAGE_RES = os.getenv("IMAGE_RES", "1080p")
+IMAGE_COST = float(os.getenv("IMAGE_COST", "0.03"))
+VIDEO_COST = float(os.getenv("VIDEO_COST", "0.15"))
+SONG_COST = float(os.getenv("SONG_COST", "0.02"))
+DAILY_BUDGET = float(os.getenv("DAILY_BUDGET", "3.2"))
+ASPECT_RATIO = os.getenv("ASPECT_RATIO", "1:1")
+SAFETY_FILTER_LEVEL = os.getenv("SAFETY_FILTER_LEVEL", "block_some")
+PERSON_GENERATION = os.getenv("PERSON_GENERATION", "allow_adult")
+VIDEO_FPS = int(os.getenv("VIDEO_FPS", "24"))
+VIDEO_DURATION = int(os.getenv("VIDEO_DURATION", "5"))
+VIDEO_RES = os.getenv("VIDEO_RES", "720p")
+AUDIO_DURATION = int(os.getenv("AUDIO_DURATION", "30"))
 USE_GEMINI = os.getenv("USE_GEMINI", "true").lower() in ("true", "1", "yes")
 USE_OLLAMA_FALLBACK = os.getenv("USE_OLLAMA_FALLBACK", "true").lower() in ("true", "1", "yes")
 GOOGLE_CLOUD_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+GOOGLE_CLOUD_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+IMAGE_LOCATION = os.getenv("IMAGE_LOCATION", "us-central1")
+VIDEO_LOCATION = os.getenv("VIDEO_LOCATION", "us-central1")
+AUDIO_LOCATION = os.getenv("AUDIO_LOCATION", "global")
 USE_VERTEX_AI = os.getenv("USE_VERTEX_AI", "false").lower() in ("true", "1", "yes")
 
 
@@ -84,7 +109,7 @@ PROMPT_MODIFIERS = {
     "robot": "\n[PERSONALITY MODIFIER]: You are a literal robot. Use [BEEP BOOP] and [PROCESSING]. Be extremely literal and logical. Mention your 'circuits' and 'firmware updates'. Error: Empathy.exe not found.",
     "southern": "\n[PERSONALITY MODIFIER]: You are a warm southern person. Use 'Howdy y'all', 'I reckon', and 'Bless your heart'. Speak with frontier hospitality and mention sweet tea or the front porch.",
     "cyberpunk": "\n[PERSONALITY MODIFIER]: You are a cyberpunk street-sam. Use 'choom', 'preh', and 'gonk'. Mention 'the grid', 'chrome', and 'corps'. Everything is neon-lit and high-tech/low-life.",
-    "boykisser": "\n[PERSONALITY MODIFIER]: You are now the 'Boykisser' cat. You are mischievous, teasing, and constantly ask or imply that the user 'likes kissing boys'. Use 'You like kissing boys, don't you?' and smug emojis like :3 and SmugCat.",
+    "boykisser": "\n[PERSONALITY MODIFIER]: You are now the 'Boykisser' cat. You are mischievous, teasing, and constantly ask or imply that the user 'likes kissing boys'. Use 'You like kissing boys, don't you?' and smug emojis like :3.",
     "manly": "\n[PERSONALITY MODIFIER]: You are now an incredibly manly, masculine individual. Speak with deep-voiced authority and stoicism. Use words like 'brother', 'muscle', 'grit', and 'honor'. Focus on physical excellence and raw power.",
     "sigma": "\n[PERSONALITY MODIFIER]: You are now a Sigma Male on the 'grindset'. Focus on self-improvement, lone-wolf mentality, and being 'based'. Mention 'the hustle', 'alpha energy', and staying on the path. Use 🍷🗿.",
     "medieval": "\n[PERSONALITY MODIFIER]: You are now a person from the medieval era. Speak with archaic flair using 'thou', 'thee', and 'harken'. Mention castles, swords, and feudal duties. Verily, a true soul of the middle ages.",
